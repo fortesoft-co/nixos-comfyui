@@ -1,0 +1,7 @@
+# Editor/build artifacts
+__pycache__/
+result
+result-*
+.DS_Store
+.scratch/
+
