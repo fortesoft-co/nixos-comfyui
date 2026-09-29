@@ -36,11 +36,10 @@
 # as fallback; everything else fetches with resumable curl. Entries pin the
 # revision via the ./sources.nix constructors and gate the result against
 # sha256 regardless of transport.
-{
+args@{
   config,
   pkgs,
   lib,
-  civitai-cli ? null,
   ...
 }:
 let
@@ -61,14 +60,23 @@ let
   # CivitAI CLI (github:civitai/cli) — the transport for source = "civitai"
   # entries when the consumer threads the flake via specialArgs, mirroring
   # the hf CLI pattern (CLI first, resumable curl fallback). Without the
-  # flake input, civitai entries keep the plain-curl behavior.
+  # flake input, civitai entries fall back to the download endpoint over
+  # plain curl. (An optional module arg breaks evalModules' arg resolution
+  # for missing external args, so the package is read off the full
+  # module-args attrset instead — absent means absent, never an error.)
   hasCivitaiDownloads = lib.any (dl: dl.source or null == "civitai") (
     lib.attrValues cfg.downloads
   );
   civitaiCliPkg =
-    if civitai-cli != null
-    then civitai-cli.packages.${pkgs.system}.default or null
-    else null;
+    let
+      cliFlake = args."civitai-cli" or null;
+    in
+    if cliFlake == null then
+      null
+    else
+      if (cliFlake.packages or null) != null
+      then cliFlake.packages.${pkgs.system}.default or null
+      else null;
 
   mkDownloadService =
     {
@@ -143,7 +151,7 @@ let
                 urls = [ dl.url ] ++ dl.fallbackUrls;
               in
               ''fetch_one ${esc dest} ${esc hash} ${esc tokenFile} ${lib.concatMapStringsSep " " esc urls}'';
-          unzip = lib.optional (dl.unzipInto != null) ''unzip_into ${esc dest} ${esc dl.unzipInto} ${esc hash}'';
+          unzip = lib.optional (dl.unzipInto != null) ''if ! unzip_into ${esc dest} ${esc dl.unzipInto} ${esc hash}; then echo "unzip failed: ${esc dest}" >&2; failed=1; fi'';
         in
         { inherit dest hash fetchArgs unzip esc key; }
       ) downloads;
@@ -169,7 +177,7 @@ let
         # move it into place; loud failure otherwise.
         verify_or_move() {
           local dest="$1" hash="$2"
-          if [[ -z "$hash" ]] || echo "$hash  $dest.part" | ${pkgs.coreutils}/bin/sha256sum --check --quiet; then
+          if [[ -z "$hash" ]] || [[ "$(${pkgs.openssl}/bin/openssl dgst -sha256 -r "$dest.part" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" == "$hash" ]]; then
             mv "$dest.part" "$dest"
             return 0
           fi
@@ -258,24 +266,26 @@ let
         # place (the CLI's own rename already made it atomic).
         verify_in_place() {
           local dest="$1" hash="$2"
-          if [[ -z "$hash" ]] || echo "$hash  $dest" | ${pkgs.coreutils}/bin/sha256sum --check --quiet; then
+          if [[ -z "$hash" ]] || [[ "$(${pkgs.openssl}/bin/openssl dgst -sha256 -r "$dest" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" == "$hash" ]]; then
             return 0
           fi
           echo "sha256 mismatch for $dest" >&2
           rm -f "$dest"
           return 1
         }
+        ${lib.optionalString (civitaiCliPkg != null) ''
         # fetch_civitai <dest> <sha256|empty> <tokenFile|empty> <versionId>
-        #           [file|empty] — civitai CLI transport: streams to
-        # <target>.part and renames into place on success while verifying
-        # the server's own SHA256; the entry's pinned hash then gates the
-        # final file (authoritative — the API hash can drift when an author
-        # re-uploads inside a version). --file picks a specific file in a
-        # multi-file version. On CLI failure falls back to the download
-        # endpoint over resumable curl (primary-file downloads only — a
-        # --file request has no curl equivalent).
+        #           [file|empty] [fallback-url...] — civitai CLI transport:
+        # streams to <target>.part and renames into place on success while
+        # verifying the server's own SHA256; the entry's pinned hash then
+        # gates the final file (authoritative — the API hash can drift when
+        # an author re-uploads inside a version). --file picks a specific
+        # file in a multi-file version. On CLI failure falls back to the
+        # download endpoint over resumable curl (primary-file downloads
+        # only — a --file request has no curl equivalent).
         fetch_civitai() {
           local dest="$1" hash="$2" token_file="$3" version_id="$4" file="''${5:-}"
+          shift 5
           if [[ -e "$dest" ]]; then
             echo "have: $dest"
             return 0
@@ -285,9 +295,16 @@ let
           local -a dl_args=(--version "$version_id" --out "$dest")
           [[ -n "$file" ]] && dl_args+=(--file "$file")
           local cli_ok=1
-          if CIVITAI_TOKEN="$(cat "$token_file")" CIVITAI_NO_UPDATE_CHECK=1 \
-            ${civitaiCliPkg}/bin/civitai download "''${dl_args[@]}"; then
-            cli_ok=0
+          if [[ -n "$token_file" ]]; then
+            if CIVITAI_TOKEN="$(cat "$token_file")" CIVITAI_NO_UPDATE_CHECK=1 \
+              ${civitaiCliPkg}/bin/civitai download "''${dl_args[@]}"; then
+              cli_ok=0
+            fi
+          else
+            if CIVITAI_NO_UPDATE_CHECK=1 \
+              ${civitaiCliPkg}/bin/civitai download "''${dl_args[@]}"; then
+              cli_ok=0
+            fi
           fi
           if [[ $cli_ok -eq 0 ]] && verify_in_place "$dest" "$hash"; then
             return 0
@@ -298,6 +315,7 @@ let
           fi
           return 1
         }
+        ''}
         # fetch_hf <dest> <sha256|empty> <tokenFile|empty> <repo> <rev> <file>
         #           [fallback-url...] — HuggingFace transport via the hf CLI
         # (native xet chunks, gated-repo auth via HF_TOKEN). Downloads into a
@@ -326,7 +344,7 @@ let
               hf_ok=0
             fi
           fi
-          if [[ -z "$hash" ]] || echo "$hash  $stage/$file" | ${pkgs.coreutils}/bin/sha256sum --check --quiet; then
+          if [[ -z "$hash" ]] || [[ "$(${pkgs.openssl}/bin/openssl dgst -sha256 -r "$stage/$file" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" == "$hash" ]]; then
             verified=1
           fi
           if [[ $hf_ok -eq 0 && $verified -eq 1 ]]; then
@@ -355,9 +373,13 @@ let
         # verified fetch/repair; audit runs skip hashing unchanged rows.
         PINS_MANIFEST=".pins.sha256.tsv"
 
+        # sha256 via openssl — the libcrypto SHA-NI path measured ~3.7x
+        # the gnulib one inside coreutils' sha256sum on this pool's
+        # hardware; file-level parallelism arrives with the pin-store
+        # redesign, where the audit walk is over a flat directory.
         file_sha() {
           local p="$1"
-          ${pkgs.coreutils}/bin/sha256sum "$p" | ${pkgs.coreutils}/bin/cut -d' ' -f1
+          ${pkgs.openssl}/bin/openssl dgst -sha256 -r "$p" | ${pkgs.coreutils}/bin/cut -d' ' -f1
         }
 
         # manifest_row <dest> -> "<size>\t<mtime>\t<sha256>" or empty
@@ -550,13 +572,18 @@ let
           return 0
         }
 
+        # Numbered entry transports — the boot (ensure) and audit (repair)
+        # passes re-run the exact same fetch for a pin via entry_<n>,
+        # regardless of transport.
+        ${lib.concatMapStringsSep "\n" (e: "entry_${e.n}() { ${e.fetchArgs}; }") indexed}
+        failed=0
         MODE="''${1:-fetch}"
         case "$MODE" in
           fetch)
             ${
               if enforce then
                 lib.concatMapStringsSep "\n" (
-                  e: ''ensure ${lib.escapeShellArg e.dest} ${lib.escapeShellArg e.hash} entry_${e.n}''
+                  e: ''if ! ensure ${lib.escapeShellArg e.dest} ${lib.escapeShellArg e.hash} entry_${e.n}; then echo "pin failed: ${lib.escapeShellArg e.dest}" >&2; failed=1; fi''
                 ) indexed
               else
                 # unenforced: pure fetch (legacy semantics — entry functions
@@ -564,9 +591,12 @@ let
                 lib.concatMapStringsSep "\n" (e: e.fetchArgs) indexed
             }
             ${lib.concatStringsSep "\n" (lib.concatLists (map (e: e.unzip) entries))}
+            if [[ "$failed" -ne 0 ]]; then
+              echo "download-fetch: entries failed (see above)" >&2
+              exit 1
+            fi
             ;;
           audit)
-            failed=0
             ${lib.concatMapStringsSep "\n" (
               e: ''if ! audit_entry ${lib.escapeShellArg e.dest} ${lib.escapeShellArg e.hash} entry_${e.n}; then echo "audit failed: ${lib.escapeShellArg e.dest}" >&2; failed=1; fi''
             ) indexed}
