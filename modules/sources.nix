@@ -24,11 +24,17 @@ in
     file,
     sha256,
     unzipInto ? null,
+    # structured destination (see cfg.comfyui.downloads): models/<type>/<arch>/<name>
+    # or an explicit dest; both optional — omit for a bare attrset/path key.
+    type ? null,
+    arch ? [ ],
+    name ? null,
+    dest ? null,
   }: {
     source = "huggingface";
     inherit repo rev file;
     tokenFile = cfg.huggingfaceTokenFile;
-    inherit sha256 unzipInto;
+    inherit sha256 unzipInto type arch name dest;
   };
 
   # CivitAI model version, resolved via the public API
@@ -48,10 +54,15 @@ in
     sha256,
     file ? null,
     unzipInto ? null,
+    # structured destination fields — models/<type>/<arch>/<name>
+    type ? null,
+    arch ? [ ],
+    name ? null,
+    dest ? null,
   }: {
     source = "civitai";
     url = "https://civitai.com/api/download/models/${versionId}";
-    inherit versionId sha256 file unzipInto;
+    inherit versionId sha256 file unzipInto type arch name dest;
     tokenFile = cfg.civitaiApiKeyFile;
   };
 }

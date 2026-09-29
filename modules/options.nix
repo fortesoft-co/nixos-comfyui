@@ -161,6 +161,50 @@ with lib;
               default = null;
               description = "Repo-relative file path, used with source = \"huggingface\".";
             };
+
+            # --- destination (structured entries) ---
+            type = mkOption {
+              type = with types; nullOr str;
+              default = null;
+              description = ''
+                ComfyUI models/ subdirectory for this entry (e.g. "loras",
+                "checkpoints", "diffusion_models"). Set it on id-keyed
+                entries; the destination then becomes
+                models/<type>/<arch>/<name>. Single path segment — no
+                slashes or "."-tricks; validated at eval.
+              '';
+            };
+
+            arch = mkOption {
+              type = with types; coercedTo str (a: [ a ]) (listOf str);
+              default = [ ];
+              description = ''
+                Optional architecture/family subpath segment(s) under
+                models/<type>/ — e.g. "wan" or ["WanVideo" "Lightx2v"]
+                for a two-level family path. Single segments, no slashes.
+              '';
+            };
+
+            name = mkOption {
+              type = with types; nullOr str;
+              default = null;
+              description = ''
+                Destination basename for structured entries. Only set it when
+                the wanted local filename differs from the upstream fetched
+                filename; otherwise the fetch installs under its own name.
+              '';
+            };
+
+            dest = mkOption {
+              type = with types; nullOr str;
+              default = null;
+              description = ''
+                Explicit dataDir-relative destination, bypassing the
+                models/<type>/<arch>/<name> composition — for non-model
+                entries (user/default/workflows/...). Mutually exclusive
+                with type.
+              '';
+            };
             versionId = mkOption {
               type = with types; nullOr str;
               default = null;
@@ -213,6 +257,31 @@ with lib;
         }
       );
       default = { };
+    };
+
+    enforcePaths = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Enforce pinned destinations. On every boot: pinned files that went
+        missing are restored from a same-filesystem stray copy (size- and
+        sha256-verified) when one exists, files whose size changed versus
+        the last verified state are repaired, and plain fetches only run
+        for genuinely missing content.
+      '';
+    };
+
+    auditSchedule = mkOption {
+      type = with types; nullOr str;
+      default = null;
+      description = ''
+        systemd OnCalendar schedule for <target>-download-audit — a full
+        sha256 sweep over pinned entries (mtime+size manifest-skipped) with
+        stray-rescue and repair: moved files restored in place, hash
+        mismatches refetched after the local impostor is removed (only once
+        the replacement is hash-verified), everything logged. null disables
+        the unit. Example: "weekly" or "Sun 05:00".
+      '';
     };
   };
 }
