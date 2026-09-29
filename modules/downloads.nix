@@ -1,17 +1,41 @@
 # Download fetching: multi-GB model files and other artifacts (workflows,
-# pose packs, ...) stay out of the nix store. `mkDownloadService` builds a
-# oneshot systemd service from cfg.comfyui.downloads — an attrset of
-# { path-relative-to-dataDir -> entry } — fetching anything missing before
-# the ComfyUI service starts. Entries tagged source = "huggingface"
-# (built by hfFetch in ./sources.nix) download with the hf CLI — native xet
-# transport, gated-repo auth — and fall back to the resolve URL over curl;
-# civitai-tagged entries (civitaiFetch) download through the official
-# civitai CLI when the consumer threads it via specialArgs, with the
-# download endpoint over resumable curl as fallback; everything else
-# fetches with resumable curl. Build entries with the constructors in
-# ./sources.nix (they pin the revision and inject the right token per
-# source); every entry's pinned sha256 gates the result regardless of
-# transport.
+# pose packs, ...) stay out of the nix store. `mkDownloadService` builds
+# oneshot services from cfg.comfyui.downloads — an attrset of
+# { id-or-legacy-path -> entry } — fetching anything missing before the
+# ComfyUI service starts.
+#
+# Destinations: entries are either path-keyed (attrset key = dataDir-relative
+# path, the legacy form) or structured — an id-keyed entry setting
+# `type` (a ComfyUI models/ subdir) + `name` (+ optional `arch` subpath
+# segment(s), e.g. arch = "wan" or ["WanVideo" "Lightx2v"]) composes
+# models/<type>/<arch>/<name>. Non-model entries (user/default/workflows/...)
+# set `dest` directly. Derived destinations are asserted unique at eval.
+#
+# Enforcement (enforcePaths): the fetch unit runs a stat-cheap pin pass
+# before fetching — a pinned file that went missing is restored from a
+# stray copy on the same filesystem (size + sha256 verified, and moving on
+# a single pool is an atomic rename) rather than re-fetched; a pinned file
+# whose size changed versus its manifest is repaired (impostor moved aside
+# → refetch → impostor freed only after the replacement is hash-verified).
+# Entries with a sha256 pin are rescue-eligible; unpinned entries get a
+# presence-only pass.
+#
+# auditSchedule adds <target>-download-audit.service/.timer: a scheduled
+# full sha256 sweep over pinned entries (mtime+size manifest-skipped, so
+# unchanged content costs syscalls and nothing more) with the same repair
+# semantics — size-equal hash mismatches are invisible to the cheap pass
+# and only this sweep catches them. Repair never destroys local bytes
+# until the refetch's replacement is hash-verified in staging; when the
+# upstream is gone the impostor stays in place and the unit fails loudly.
+#
+# Transports: entries tagged source = "huggingface" (built by hfFetch in
+# ./sources.nix) download with the hf CLI — native xet transport, gated-repo
+# auth — and fall back to the resolve URL over curl; civitai-tagged entries
+# (civitaiFetch) download through the official civitai CLI when the consumer
+# threads it via specialArgs, with the download endpoint over resumable curl
+# as fallback; everything else fetches with resumable curl. Entries pin the
+# revision via the ./sources.nix constructors and gate the result against
+# sha256 regardless of transport.
 {
   config,
   pkgs,
@@ -46,31 +70,95 @@ let
     then civitai-cli.packages.${pkgs.system}.default or null
     else null;
 
-  # Build the oneshot service that fetches `downloads` into `dataDir`
-  # before `target`'s service starts. Idempotent: existing files are never
-  # touched; each entry tries its URL then fallbackUrls in order (so an
-  # entry survives its source repo removing the file — just add a mirror);
-  # finished downloads are verified against sha256 when the entry provides
-  # one.
-  mkDownloadService = {
-    dataDir,
-    user,
-    downloads,
-    mountUnits ? [ ],
-    target ? "comfyui",
-  }: {
-    systemd.services."${target}-download-fetch" = {
-      description = "Fetch ComfyUI downloads";
-      before = [ "${target}.service" ];
-      requiredBy = [ "${target}.service" ];
-      after = mountUnits;
-      requires = mountUnits;
-      serviceConfig = {
-        Type = "oneshot";
-        User = user;
-        TimeoutStartSec = 0;
+  mkDownloadService =
+    {
+      dataDir,
+      user,
+      downloads,
+      enforce ? true,
+      auditSchedule ? null,
+      mountUnits ? [ ],
+      target ? "comfyui",
+    }:
+    let
+      # Destination resolution. Exactly one of:
+      #   - explicit dest (non-model entries),
+      #   - structured: models/<type>/<arch segments>/<name>,
+      #   - legacy: the attrset key itself is a dataDir-relative path.
+      segOk =
+        s: s != "" && s != "." && !lib.hasInfix "/" s && !lib.hasInfix ".." s;
+      destOf =
+        key: dl:
+        if dl.dest != null then
+          if dl.type != null then
+            throw "downloads[\"${key}\"]: set either dest or type, not both"
+          else dl.dest
+        else if dl.type != null then
+          if dl.name == null then
+            throw "downloads[\"${key}\"]: structured entry (type set) needs a name"
+          else if !lib.all segOk ([ dl.type ] ++ dl.arch ++ [ dl.name ]) then
+            throw "downloads[\"${key}\"]: type/arch/name must be single path segments"
+          else lib.concatStringsSep "/" ([ "models" dl.type ] ++ dl.arch ++ [ dl.name ])
+        else if !lib.hasInfix "/" key then
+          throw "downloads[\"${key}\"]: id-keyed entries need a type+name or a dest"
+        else
+          # legacy: the attrset key is the dataDir-relative destination
+          key;
+
+      hashOf = dl: if dl.sha256 != null then dl.sha256 else "";
+      tokenOf = dl: if dl.tokenFile != null then dl.tokenFile else "";
+
+      entries = lib.mapAttrsToList (
+        key: dl:
+        let
+          esc = lib.escapeShellArg;
+          dest = destOf key dl;
+          hash = hashOf dl;
+          tokenFile = tokenOf dl;
+          isHf = dl.source or null == "huggingface";
+          isCivitai = dl.source or null == "civitai";
+          fetchArgs =
+            if isHf then
+              # The hf CLI is the transport; the resolve URL is
+              # reconstructed inside fetch_hf as the first curl
+              # fallback, so only extra mirrors are passed here.
+              ''fetch_hf ${esc dest} ${esc hash} ${esc tokenFile} ${esc dl.repo} ${esc dl.rev} ${esc dl.file} ${lib.concatMapStringsSep " " esc dl.fallbackUrls}''
+            else if isCivitai && civitaiCliPkg != null then
+              # The CLI transport; the download endpoint is
+              # reconstructed inside fetch_civitai as the curl
+              # fallback, so only extra mirrors are passed here.
+              let
+                civArgs = [
+                  "fetch_civitai"
+                  dest
+                  hash
+                  tokenFile
+                  dl.versionId
+                  (if dl.file != null then dl.file else "")
+                ] ++ dl.fallbackUrls;
+              in
+              lib.concatMapStringsSep " " esc civArgs
+            else
+              let
+                urls = [ dl.url ] ++ dl.fallbackUrls;
+              in
+              ''fetch_one ${esc dest} ${esc hash} ${esc tokenFile} ${lib.concatMapStringsSep " " esc urls}'';
+          unzip = lib.optional (dl.unzipInto != null) ''unzip_into ${esc dest} ${esc dl.unzipInto} ${esc hash}'';
+        in
+        { inherit dest hash fetchArgs unzip esc key; }
+      ) downloads;
+
+      indexed = lib.imap1 (i: e: e // { n = toString i; }) entries;
+
+      destsList = map (e: e.dest) entries;
+      dupDests = lib.filter (d: lib.length (lib.filter (x: x == d) destsList) > 1) (lib.unique destsList);
+      uniqueDestAssertion = {
+        assertion = dupDests == [ ];
+        message =
+          "comfyui downloads: duplicate destinations (${lib.concatStringsSep ", " dupDests}) — every entry must resolve to a distinct file";
       };
-      script = ''
+
+      fetchScript = pkgs.writeShellScript "${target}-download-fetch" ''
         set -euo pipefail
         export PATH=${pkgs.coreutils}/bin${lib.optionalString hasHfDownloads ":${hfEnv}/bin"}${lib.optionalString (hasCivitaiDownloads && civitaiCliPkg != null) ":${civitaiCliPkg}/bin"}
         ${lib.optionalString hasHfDownloads ''
@@ -256,51 +344,291 @@ let
           # fetch_one already reported "all sources failed".
           return 1
         }
+
+        # ----------------------------------------------------------------------
+        # Pin enforcement. Nothing local is ever destroyed until its
+        # replacement is hash-verified on disk; upstream death leaves the
+        # local bytes in place and fails loudly.
+        # ----------------------------------------------------------------------
         cd ${dataDir}
-        ${lib.concatStringsSep "\n" (
-          let
-            entries = lib.mapAttrsToList (
-              dest: dl:
-              let
-                hash = if dl.sha256 != null then dl.sha256 else "";
-                tokenFile = if dl.tokenFile != null then dl.tokenFile else "";
-                esc = lib.escapeShellArg;
-                isHf = dl.source or null == "huggingface";
-                isCivitai = dl.source or null == "civitai";
-                fetchLine =
-                  if isHf then
-                    # The hf CLI is the transport; the resolve URL is
-                    # reconstructed inside fetch_hf as the first curl
-                    # fallback, so only extra mirrors are passed here.
-                    ''fetch_hf ${esc dest} ${esc hash} ${esc tokenFile} ${esc dl.repo} ${esc dl.rev} ${esc dl.file} ${lib.concatMapStringsSep " " esc dl.fallbackUrls}''
-                  else if isCivitai && civitaiCliPkg != null then
-                    # The CLI transport; the download endpoint is
-                    # reconstructed inside fetch_civitai as the curl
-                    # fallback, so only extra mirrors are passed here.
-                    let
-                      civArgs =
-                        [ "fetch_civitai" dest hash tokenFile dl.versionId (if dl.file != null then dl.file else "") ]
-                        ++ dl.fallbackUrls;
-                    in
-                    lib.concatMapStringsSep " " esc civArgs
-                  else
-                    let
-                      urls = [ dl.url ] ++ dl.fallbackUrls;
-                    in
-                    ''fetch_one ${esc dest} ${esc hash} ${esc tokenFile} ${lib.concatMapStringsSep " " esc urls}'';
-              in
-              {
-                fetch = [ fetchLine ];
-                unzip = lib.optional (dl.unzipInto != null) ''unzip_into ${esc dest} ${esc dl.unzipInto} ${esc hash}'';
-              }
-            ) downloads;
-          in
-          lib.concatLists (map (e: e.fetch) entries)
-          ++ lib.concatLists (map (e: e.unzip) entries)
-        )}
+        # dest \t size \t mtime(epoch secs) \t sha256 — written after every
+        # verified fetch/repair; audit runs skip hashing unchanged rows.
+        PINS_MANIFEST=".pins.sha256.tsv"
+
+        file_sha() {
+          local p="$1"
+          ${pkgs.coreutils}/bin/sha256sum "$p" | ${pkgs.coreutils}/bin/cut -d' ' -f1
+        }
+
+        # manifest_row <dest> -> "<size>\t<mtime>\t<sha256>" or empty
+        manifest_row() {
+          local dest="$1"
+          [[ -f "$PINS_MANIFEST" ]] || return 0
+          ${pkgs.gawk}/bin/awk -F'\t' -v d="$dest" '$1 == d { print $2 "\t" $3 "\t" $4; exit }' "$PINS_MANIFEST"
+        }
+
+        # manifest_set <dest> <size> <mtime> <sha256|empty>
+        manifest_set() {
+          local dest="$1" size="$2" mtime="$3" sha="$4"
+          local tmp="$PINS_MANIFEST.tmp"
+          if [[ -f "$PINS_MANIFEST" ]]; then
+            ${pkgs.gawk}/bin/awk -F'\t' -v d="$dest" '$1 != d' "$PINS_MANIFEST" > "$tmp"
+          else
+            : > "$tmp"
+          fi
+          printf '%s\t%s\t%s\t%s\n' "$dest" "$size" "$mtime" "$sha" >> "$tmp"
+          mv -f "$tmp" "$PINS_MANIFEST"
+        }
+
+        # stray_find <sha256> <expected-size|empty> — print the first path
+        # under models/ whose bytes hash to <sha256>, else fail. When a
+        # verified size is known it pre-filters candidates (an external move
+        # never changes a file's size), so the common repair hashes exactly
+        # one candidate file; without it (first run / no manifest) the whole
+        # models/ tree is hashed. Hidden entries are pruned — staging
+        # (.hfpart dirs), drift leftovers and .part temporaries never count
+        # as strays.
+        stray_find() {
+          local sha="$1" want_size="''${2:-}"
+          [[ -d models ]] || return 1
+          local -a size_args=( )
+          if [[ -n "$want_size" ]]; then
+            size_args=( -size "''${want_size}c" )
+          fi
+          local cand h
+          while IFS= read -r -d "" cand; do
+            h="$(file_sha "$cand")"
+            if [[ "$h" == "$sha" ]]; then
+              printf '%s' "$cand"
+              return 0
+            fi
+          done < <( ${pkgs.findutils}/bin/find models \( -name '.*' -prune \) -o -type f "''${size_args[@]}" -not -name '*.part' -print0 )
+          return 1
+        }
+
+        # rescue_or_fetch <dest> <sha256|empty> <entry-fn> — when the
+        # destination is gone: restore a stray copy if the pinned bytes can
+        # be found elsewhere, otherwise run the entry's transport (which
+        # stages, hash-gates and installs atomically).
+        rescue_or_fetch() {
+          local dest="$1" sha="$2" entry_fn="$3"
+          if [[ -n "$sha" ]]; then
+            local row want_size=""
+            row="$(manifest_row "$dest")"
+            if [[ -n "$row" ]]; then
+              want_size="$(printf '%s' "$row" | ${pkgs.coreutils}/bin/cut -f1)"
+            fi
+            local stray
+            if stray="$(stray_find "$sha" "$want_size")"; then
+              echo "restoring stray: $stray -> $dest"
+              mkdir -p "$(dirname "$dest")"
+              mv -f "$stray" "$dest"
+              manifest_set "$dest" "$(${pkgs.coreutils}/bin/stat -c '%s' "$dest")" "$(${pkgs.coreutils}/bin/stat -c '%Y' "$dest")" "$sha"
+              return 0
+            fi
+          fi
+          echo "missing: $dest" >&2
+          "$entry_fn" || return 1
+          manifest_set "$dest" "$(${pkgs.coreutils}/bin/stat -c '%s' "$dest")" "$(${pkgs.coreutils}/bin/stat -c '%Y' "$dest")" "$sha"
+          echo "fetched: $dest"
+          return 0
+        }
+
+        # repair <dest> <sha256> <entry-fn> — destination currently holds
+        # bytes that don't match the pin. The impostor moves to a hidden
+        # sibling (same-filesystem rename), the entry refetches into the
+        # verified staging path, and the impostor is freed only after the
+        # replacement is verified on disk — its journal line records size
+        # and hash, so nothing is lost silently. A failed fetch restores
+        # the impostor in place (never destroy the only copy when upstream
+        # is unreachable) and fails the entry.
+        repair() {
+          local dest="$1" sha="$2" entry_fn="$3"
+          local dir base drift
+          dir="$(dirname "$dest")"
+          base="$(basename "$dest")"
+          drift="$dir/.$base.drift"
+          mkdir -p "$dir"
+          mv -f "$dest" "$drift"
+          if "$entry_fn"; then
+            echo "repair: freeing impostor $(file_sha "$drift") $drift" >&2
+            rm -f "$drift"
+            manifest_set "$dest" "$(${pkgs.coreutils}/bin/stat -c '%s' "$dest")" "$(${pkgs.coreutils}/bin/stat -c '%Y' "$dest")" "$sha"
+            return 0
+          fi
+          mv -f "$drift" "$dest"
+          echo "repair failed for $dest — impostor restored in place" >&2
+          return 1
+        }
+
+        # recover drift siblings left by an interrupted repair: back to the
+        # destination when it never landed, discardable when it did.
+        recover_drift() {
+          local dest="$1"
+          local drift="$(dirname "$dest")/.$(basename "$dest").drift"
+          if [[ ! -e "$dest" && -e "$drift" ]]; then
+            echo "recovering leftover drift: $drift -> $dest"
+            mv -f "$drift" "$dest"
+          elif [[ -e "$dest" && -e "$drift" ]]; then
+            rm -f "$drift"
+          fi
+        }
+
+        # ensure <dest> <sha256|empty> <entry-fn> — boot-time pin pass:
+        # stat-cheap. Missing pins are rescued or fetched; present pins are
+        # trusted unless the verified manifest says their size changed.
+        ensure() {
+          local dest="$1" sha="$2" entry_fn="$3"
+          recover_drift "$dest"
+          if [[ ! -e "$dest" ]]; then
+            rescue_or_fetch "$dest" "$sha" "$entry_fn" || return 1
+            return 0
+          fi
+          local row dsize
+          row="$(manifest_row "$dest")"
+          dsize="$(${pkgs.coreutils}/bin/stat -c '%s' "$dest")"
+          if [[ -n "$row" ]]; then
+            local msize
+            msize="$(printf '%s' "$row" | ${pkgs.coreutils}/bin/cut -f1)"
+            if [[ "$msize" != "$dsize" ]]; then
+              echo "size drift at $dest ($msize -> $dsize)" >&2
+              if [[ -z "$sha" ]]; then
+                # presence-only entry: nothing verifiable, just restamp
+                manifest_set "$dest" "$dsize" "$(${pkgs.coreutils}/bin/stat -c '%Y' "$dest")" ""
+                return 0
+              fi
+              repair "$dest" "$sha" "$entry_fn" || return 1
+              return 0
+            fi
+          fi
+          echo "have: $dest"
+          return 0
+        }
+
+        # audit_entry <dest> <sha256|empty> <entry-fn> — scheduled deep
+        # verification. Skips hashing when mtime+size match the verified
+        # manifest row (same-second replacement of equal-size bytes is the
+        # accepted blind spot; run audit after staging anything manually).
+        audit_entry() {
+          local dest="$1" sha="$2" entry_fn="$3"
+          recover_drift "$dest"
+          if [[ ! -e "$dest" ]]; then
+            rescue_or_fetch "$dest" "$sha" "$entry_fn" || return 1
+            return 0
+          fi
+          local dsize dmt
+          dsize="$(${pkgs.coreutils}/bin/stat -c '%s' "$dest")"
+          dmt="$(${pkgs.coreutils}/bin/stat -c '%Y' "$dest")"
+          local row
+          row="$(manifest_row "$dest")"
+          if [[ -n "$row" ]]; then
+            local msize mmt msha
+            msize="$(printf '%s' "$row" | ${pkgs.coreutils}/bin/cut -f1)"
+            mmt="$(printf '%s' "$row" | ${pkgs.coreutils}/bin/cut -f2)"
+            msha="$(printf '%s' "$row" | ${pkgs.coreutils}/bin/cut -f3)"
+            if [[ "$msize" == "$dsize" && "$mmt" == "$dmt" ]]; then
+              if [[ -z "$sha" || "$msha" == "$sha" ]]; then
+                echo "verified (unchanged): $dest"
+                return 0
+              fi
+            fi
+          fi
+          if [[ -z "$sha" ]]; then
+            manifest_set "$dest" "$dsize" "$dmt" ""
+            echo "no sha256 pin — presence recorded: $dest"
+            return 0
+          fi
+          local h
+          h="$(file_sha "$dest")"
+          if [[ "$h" != "$sha" ]]; then
+            echo "sha256 mismatch: $dest (have $h, want $sha)" >&2
+            repair "$dest" "$sha" "$entry_fn" || return 1
+            return 0
+          fi
+          manifest_set "$dest" "$dsize" "$dmt" "$sha"
+          echo "verified: $dest"
+          return 0
+        }
+
+        MODE="''${1:-fetch}"
+        case "$MODE" in
+          fetch)
+            ${
+              if enforce then
+                lib.concatMapStringsSep "\n" (
+                  e: ''ensure ${lib.escapeShellArg e.dest} ${lib.escapeShellArg e.hash} entry_${e.n}''
+                ) indexed
+              else
+                # unenforced: pure fetch (legacy semantics — entry functions
+                # early-return on files that already exist)
+                lib.concatMapStringsSep "\n" (e: e.fetchArgs) indexed
+            }
+            ${lib.concatStringsSep "\n" (lib.concatLists (map (e: e.unzip) entries))}
+            ;;
+          audit)
+            failed=0
+            ${lib.concatMapStringsSep "\n" (
+              e: ''if ! audit_entry ${lib.escapeShellArg e.dest} ${lib.escapeShellArg e.hash} entry_${e.n}; then echo "audit failed: ${lib.escapeShellArg e.dest}" >&2; failed=1; fi''
+            ) indexed}
+            if [[ "$failed" -ne 0 ]]; then
+              echo "download-audit: entries failed (see above)" >&2
+              exit 1
+            fi
+            ;;
+          *)
+            echo "usage: $(basename "$0") [fetch|audit]" >&2
+            exit 2
+            ;;
+        esac
       '';
+    in
+    # Entry transports are emitted as numbered bash functions so the
+    # boot (ensure) and audit (repair) passes can re-run the exact same
+    # fetch for a pin regardless of transport. The audit unit is declared
+    # unconditionally (shape stays config-independent — an optionalAttrs
+    # here would recurse into the fixpoint during the module merge); its
+    # body is gated lazily by mkIf on the schedule.
+    {
+      assertions = [ uniqueDestAssertion ];
+      systemd.services = {
+        "${target}-download-fetch" = {
+          description = "Fetch ComfyUI downloads";
+          before = [ "${target}.service" ];
+          requiredBy = [ "${target}.service" ];
+          after = mountUnits;
+          requires = mountUnits;
+          serviceConfig = {
+            Type = "oneshot";
+            User = user;
+            TimeoutStartSec = 0;
+            ExecStart = "${fetchScript} fetch";
+          };
+        };
+        "${target}-download-audit" = lib.mkIf (auditSchedule != null) {
+          description = "Verify ComfyUI pinned downloads (sha256 sweep + repair)";
+          # never race the boot fetcher over staging areas
+          after = mountUnits ++ [ "${target}-download-fetch.service" ];
+          requires = mountUnits;
+          conflicts = [ "${target}-download-fetch.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            User = user;
+            TimeoutStartSec = 0;
+            ExecStart = "${fetchScript} audit";
+          };
+        };
+      };
+      systemd.timers = lib.mkIf (auditSchedule != null) {
+        "${target}-download-audit" = {
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnCalendar = auditSchedule;
+            Persistent = true;
+            Unit = "${target}-download-audit.service";
+          };
+        };
+      };
     };
-  };
 in
 {
   # Instantiated unconditionally: with an empty list the generated script is
@@ -308,6 +636,8 @@ in
   # (cfg.comfyui.downloads).
   config = mkDownloadService {
     inherit (cfg) dataDir user downloads;
+    enforce = cfg.enforcePaths;
+    auditSchedule = cfg.auditSchedule;
     mountUnits = cfg.requiresMounts;
   };
 }
