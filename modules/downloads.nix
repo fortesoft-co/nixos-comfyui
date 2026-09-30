@@ -29,11 +29,19 @@
 # the entry's token (huggingface resolve URLs, the civitai download
 # endpoint, plain urls + mirrors). External binaries (curl, openssl,
 # coreutils sha256sum) reach the runtime through the units' pinned
-# `path` — the host PATH is never trusted under systemd. unzipInto bundles keep today's real-file handling:
-# fetched into the dest, extracted, and re-verified against a checksum
-# manifest on every pass. Entries never overwrite existing files; drift
-# is repaired by verified replacement, and upstream death leaves local
-# bytes in place and fails loudly.
+# `path` — the host PATH is never trusted under systemd. unzipInto
+# bundles keep the real-file handling: fetched into the dest, extracted,
+# and re-verified against a checksum manifest on every pass. Entries
+# never overwrite existing files; drift is repaired by verified
+# replacement, and upstream death leaves local bytes in place and fails
+# loudly.
+#
+# Workflow pins (type = "workflows"): dest names a folder tail under
+# <workflowsDir>/nix-managed/pins (default: the entry key) and the
+# install is READ-ONLY — the artifact is placed 0444 (a zip is sniffed,
+# extracted, and discarded), the namespace's directories re-seal 0555 on
+# every pass, and content no longer claimed by a pin is removed. Full
+# contract: tools/download_runtime.py docstring.
 {
   config,
   pkgs,
@@ -53,6 +61,7 @@ let
       user,
       group ? "comfyui",
       downloads,
+      wfpinsRoot,
       enforce ? true,
       auditSchedule ? null,
       mountUnits ? [ ],
@@ -60,26 +69,49 @@ let
     }:
     let
       # Destination resolution — same contract as before: explicit dest,
-      # or models/<type>/<arch segments>/<name> for structured pins. The
-      # manifest carries the composed dataDir-relative dest; the runtime
-      # does the rest.
+      # or models/<type>/<arch segments>/<name> for structured pins. type
+      # = "workflows" composes a folder under the nix-managed/pins
+      # read-only namespace instead. The manifest carries the composed
+      # dataDir-relative dest; the runtime does the rest.
       segOk =
         s: s != "" && s != "." && !lib.hasInfix "/" s && !lib.hasInfix ".." s;
 
+      isWorkflows = dl: dl.type != null && dl.type == "workflows";
+
+      wfFolderOf =
+        key: dl:
+        let
+          tail = lib.filter (s: s != "") (
+            lib.splitString "/" (if dl.dest != null then dl.dest else key)
+          );
+        in
+        if dl.unzipInto != null then
+          throw "downloads[\"${key}\"]: unzipInto is retired — type = \"workflows\" extracts any zip at the dest automatically"
+        else if dl.arch != [ ] then
+          throw "downloads[\"${key}\"]: arch has no meaning for type = \"workflows\""
+        else if dl.name != null && !segOk dl.name then
+          throw "downloads[\"${key}\"]: name must be a single path segment"
+        else if tail == [ ] then
+          throw "downloads[\"${key}\"]: workflow entries need a dest folder tail (or a usable key)"
+        else if !lib.all segOk tail then
+          throw "downloads[\"${key}\"]: dest folder needs plain single segments (${lib.concatStringsSep "/" tail})"
+        else if lib.elem "nix-managed" tail then
+          throw "downloads[\"${key}\"]: the segment \"nix-managed\" is reserved for the read-only namespace"
+        else lib.concatStringsSep "/" tail;
+
       destOf =
         key: dl:
-        if dl.dest != null then
-          if dl.type != null then
-            throw "downloads[\"${key}\"]: set either dest or type, not both"
-          else dl.dest
+        if isWorkflows dl then
+          "${wfpinsRoot}/${wfFolderOf key dl}"
+        else if dl.dest != null then
+          dl.dest
         else if dl.type != null then
           if dl.name == null then
             throw "downloads[\"${key}\"]: structured entry (type set) needs a name"
           else if !lib.all segOk ([ dl.type ] ++ dl.arch ++ [ dl.name ]) then
             throw "downloads[\"${key}\"]: type/arch/name must be single path segments"
           else lib.concatStringsSep "/" ([ "models" dl.type ] ++ dl.arch ++ [ dl.name ])
-        else
-          throw "downloads[\"${key}\"]: id-keyed entries need a type+name or a dest";
+        else throw "downloads[\"${key}\"]\"]: id-keyed entries need a type+name or a dest";
 
       entryOf =
         key: dl:
@@ -99,14 +131,18 @@ let
         in
         {
           id = key;
+          kind = if isWorkflows dl then "workflow" else null;
           dest = destOf key dl;
           sha256 = if dl.sha256 != null then dl.sha256 else "";
           tokenFile = dl.tokenFile or null;
           unzipInto = dl.unzipInto or null;
+          name = if isWorkflows dl then dl.name else null;
           inherit (dl) fallbackUrls;
           urls = urls;
-          legacy = (dl.unzipInto or null) != null
-            || !(lib.hasPrefix "models/" (destOf key dl));
+          legacy =
+            if isWorkflows dl then false
+            else (dl.unzipInto or null) != null
+              || !(lib.hasPrefix "models/" (destOf key dl));
           provenance = lib.filterAttrs (n: v: v != null) {
             source = dl.source;
             inherit (dl) versionId repo rev file;
@@ -167,7 +203,7 @@ let
             Type = "oneshot";
             User = user;
             TimeoutStartSec = 0;
-            ExecStart = "${storeBin} ensure --manifest ${pinManifest} --dataDir ${dataDir} --jobs 8${lib.optionalString (!enforce) " --no-enforce"}";
+            ExecStart = "${storeBin} ensure --manifest ${pinManifest} --dataDir ${dataDir} --wfpins ${wfpinsRoot} --jobs 8${lib.optionalString (!enforce) " --no-enforce"}";
           };
         };
         "${target}-pin-seal" = {
@@ -196,7 +232,7 @@ let
             Type = "oneshot";
             User = user;
             TimeoutStartSec = 0;
-            ExecStart = "${storeBin} audit --manifest ${pinManifest} --dataDir ${dataDir} --jobs 8${lib.optionalString (!enforce) " --no-enforce"}";
+            ExecStart = "${storeBin} audit --manifest ${pinManifest} --dataDir ${dataDir} --wfpins ${wfpinsRoot} --jobs 8${lib.optionalString (!enforce) " --no-enforce"}";
           };
         };
       };
@@ -216,6 +252,7 @@ in
   # Instantiated unconditionally: with an empty list the units are no-ops.
   config = mkPinStoreUnits {
     inherit (cfg) dataDir user group downloads;
+    wfpinsRoot = "${cfg.workflowsDir}/nix-managed/pins";
     enforce = cfg.enforcePaths;
     auditSchedule = cfg.auditSchedule;
     mountUnits = cfg.requiresMounts;

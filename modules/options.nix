@@ -168,11 +168,13 @@ with lib;
               type = with types; nullOr str;
               default = null;
               description = ''
-                ComfyUI models/ subdirectory for this entry (e.g. "loras",
-                "checkpoints", "diffusion_models"). Set it on id-keyed
-                entries; the destination then becomes
-                models/<type>/<arch>/<name>. Single path segment — no
-                slashes or "."-tricks; validated at eval.
+                For id-keyed model entries: the ComfyUI models/ subdirectory
+                (e.g. "loras", "checkpoints", "diffusion_models") — the
+                destination then becomes models/<type>/<arch>/<name>.
+                The special value "workflows" marks a read-only workflow
+                pin: the entry installs into the nix-managed/pins namespace
+                (see dest) instead of models/. Single path segment;
+                validated at eval.
               '';
             };
 
@@ -190,9 +192,11 @@ with lib;
               type = with types; nullOr str;
               default = null;
               description = ''
-                Destination basename for structured entries. Only set it when
-                the wanted local filename differs from the upstream fetched
-                filename; otherwise the fetch installs under its own name.
+                For model entries: destination basename when the wanted
+                local filename differs from the upstream fetched filename.
+                For type = "workflows" entries: single-file pins place the
+                downloaded file under this name (default: the URL's last
+                path segment, else the entry key).
               '';
             };
 
@@ -200,10 +204,14 @@ with lib;
               type = with types; nullOr str;
               default = null;
               description = ''
-                Explicit dataDir-relative destination, bypassing the
-                models/<type>/<arch>/<name> composition — for non-model
-                entries (user/default/workflows/...). Mutually exclusive
-                with type.
+                For model entries: explicit dataDir-relative destination,
+                bypassing the models/<type>/<arch>/<name> composition.
+                For type = "workflows" entries: an optional folder tail
+                under <workflowsDir>/nix-managed/pins (default: the entry
+                key) — the fetched artifact (file or zip contents) installs
+                read-only into that folder, and a pin removed from the
+                manifest removes it. Mutually exclusive with type for model
+                entries; for workflows it is the folder tail.
               '';
             };
             versionId = mkOption {
@@ -246,12 +254,12 @@ with lib;
               type = with types; nullOr str;
               default = null;
               description = ''
-                When set, the fetched file is treated as a ZIP archive and
-                extracted into this dataDir-relative directory (workflow
-                bundles and the like); the archive itself stays where the
-                entry's key places it. Extraction runs once per archive
-                sha256, and the tree is checksum-manifested and re-verified
-                on every boot — drift is repaired by re-extracting.
+                Legacy extraction: the fetched file is treated as a ZIP and
+                extracted into this dataDir-relative directory (plain-file
+                entries stay unverified between passes; the archive stays on
+                disk). Retired — type = "workflows" extracts any zip at the
+                dest automatically, checksum-manifested per file, archive
+                discarded, read-only. New entries should not use it.
               '';
             };
           };

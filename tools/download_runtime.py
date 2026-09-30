@@ -17,6 +17,24 @@ One binary, three subcommands, three units:
           today's real-file handling: fetch straight to the dest
           (sha-gated), extract when unzipInto, verify against the
           checksum manifest each pass
+        - type="workflows" entries (kind: workflow) install into a
+          READ-ONLY namespace (--wfpins, <workflowsDir>/nix-managed/pins):
+          a plain file lands as <name or url-basename> (0444); a zip is
+          sniffed after the sha gate, extracted with structure preserved,
+          and the archive discarded. Per-pass verification: single files
+          hash against the pin sha; zip trees against a per-file checksum
+          manifest kept in <work>/wf-pin-state/<id>.json (hidden from the
+          ComfyUI browser, which walks dotfiles). Drifted/stale files are
+          parked under quarantine/<id>/ (recoverable), then refetched and
+          re-extracted. A dropped pin's unclaimed content is REMOVED
+          outright — the namespace is nix-owned and the bytes stay in the
+          consumer's git history. Strays directly under the shared
+          nix-managed root are listed (ORPHAN), never removed. All
+          directories in the namespace are re-sealed 0555 at the end of
+          every pass: ComfyUI's userdata save is mkstemp(dir)+os.replace,
+          needing only directory write — the sealed dirs are what make
+          saves into the namespace fail loudly (0444 files alone would
+          not).
     <bin> seal    --manifest ...   (root oneshot)
         consumes promote.json: re-measures every row's bytes, places them
         into <store>/<name>--<digest><ext> (0444, root:root), writes the
@@ -45,6 +63,7 @@ import concurrent.futures
 import dataclasses
 import datetime
 import grp
+import hashlib
 import json
 import os
 import pwd
@@ -52,9 +71,10 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 import zipfile
 
-VERSION = "download_runtime 1.2"
+VERSION = "download_runtime 1.3"
 
 CURL_CANDIDATES = ["curl"]
 OPENSSL_CANDIDATES = ["openssl"]
@@ -157,6 +177,22 @@ class Pin:
     def legacy(self):
         """True for entries that keep real-file handling (workflows/dest)."""
         return bool(self.raw.get("legacy"))
+
+    @property
+    def kind(self):
+        return self.raw.get("kind") or None
+
+    @property
+    def wf_name(self):
+        """Placed file name for single-file workflow pins."""
+        if self.raw.get("name"):
+            return self.raw["name"]
+        urls = self.raw.get("urls") or []
+        if urls:
+            last = urllib.parse.unquote(urls[0].rsplit("/", 1)[-1])
+            if last:
+                return last
+        return self.id
 
     @property
     def token(self):
@@ -364,6 +400,295 @@ def makedirs_managed(path, uid, gid):
                 warn(f"chown failed on {d}: {e}")
 
 
+# ---- read-only workflow namespace (type="workflows" pins) ------------------
+
+
+def wf_sha_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def wf_zip_members(archive_path):
+    """sha256 per regular archive member, in-process (bundles are small)."""
+    man = {}
+    with zipfile.ZipFile(archive_path) as z:
+        for info in sorted(z.infolist(), key=lambda i: i.filename):
+            name = info.filename
+            if name.endswith("/") or name.startswith("__MACOSX/"):
+                continue
+            h = hashlib.sha256()
+            with z.open(info) as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            man[name] = h.hexdigest()
+    return man
+
+
+def wf_state_path(work, pin_id):
+    safe = re.sub("[^A-Za-z0-9_.-]", "_", pin_id)
+    return os.path.join(work, "wf-pin-state", f"{safe}.json")
+
+
+def wf_widen(root):
+    """Make the namespace tree owner-writable for a pass (dirs 0755)."""
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, _files in os.walk(root):
+        for d in dirnames:
+            p = os.path.join(dirpath, d)
+            if not os.path.islink(p):
+                try:
+                    os.chmod(p, 0o755)
+                except OSError as e:
+                    warn(f"widen failed on {p}: {e}")
+    try:
+        os.chmod(root, 0o755)
+    except OSError as e:
+        warn(f"widen failed on {root}: {e}")
+
+
+def wf_seal(root):
+    """Seal the namespace between passes: directories 0555. Files were
+    already placed 0444. The sealed dirs — not the file modes — are what
+    make ComfyUI's mkstemp+os.replace saves fail loudly."""
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, _files in os.walk(root, topdown=False):
+        for d in dirnames:
+            p = os.path.join(dirpath, d)
+            if not os.path.islink(p):
+                try:
+                    os.chmod(p, 0o555)
+                except OSError as e:
+                    warn(f"seal failed on {p}: {e}")
+    try:
+        os.chmod(root, 0o555)
+    except OSError as e:
+        warn(f"seal failed on {root}: {e}")
+
+
+def wf_park(work, pin_id, src_abs, rel):
+    """Preserve drifted/stale bytes under quarantine/<id>/<rel>."""
+    safe = re.sub("[^A-Za-z0-9_.-]", "_", pin_id)
+    qdir = os.path.join(work, "quarantine", safe)
+    target = os.path.join(qdir, rel)
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.exists(target):
+            os.remove(target)  # single slot; the newest drifted bytes win
+        os.replace(src_abs, target)
+        note(f"PARKED  {pin_id}: {rel} -> quarantine/{safe}/")
+    except OSError as e:
+        warn(f"park failed {pin_id} {rel}: {e}")
+
+
+def wf_pin_entry(args, curl_tool, openssl, p):
+    """One type="workflows" pin: verify, repair, place/extract. Returns ok."""
+    data_dir = os.path.abspath(args.dataDir)
+    work = os.path.join(data_dir, args.work)
+    prefix = args.wfpins + "/"
+    if not args.enforce:
+        note(f"ok (unenforced) {p.id}: workflow namespace left alone")
+        return True
+    dest_rel = p.dest_rel or ""
+    if not dest_rel.startswith(prefix):
+        warn(f"fail {p.id}: workflow dest {dest_rel} outside the pin namespace {args.wfpins}")
+        return False
+    folder = os.path.join(data_dir, dest_rel)
+    if os.path.islink(folder) or (os.path.exists(folder) and not os.path.isdir(folder)):
+        warn(f"fail {p.id}: {folder} is not a directory")
+        return False
+    if not p.sha256 or len(p.sha256) != 64 or p.sha256 == EMPTY_SHA:
+        warn(f"fail {p.id}: missing/invalid sha256")
+        return False
+    os.makedirs(folder, exist_ok=True)
+
+    st_path = wf_state_path(work, p.id)
+    os.makedirs(os.path.dirname(st_path), exist_ok=True)
+    state = None
+    if os.path.isfile(st_path):
+        try:
+            with open(st_path) as f:
+                state = json.load(f)
+        except (OSError, ValueError) as e:
+            warn(f"warn {p.id}: unreadable pin state ({e}) — re-extracting")
+            state = None
+
+    have = {}
+    for dirpath, _dn, files in os.walk(folder):
+        for fn in files:
+            ap = os.path.join(dirpath, fn)
+            if os.path.islink(ap) or not os.path.isfile(ap):
+                continue
+            have[os.path.relpath(ap, folder).replace(os.sep, "/")] = ap
+
+    # ---- verify pass --------------------------------------------------------
+    if state:
+        stamp_ok = state.get("archive_sha") == p.sha256
+        drifted = []
+        if stamp_ok:
+            for rel in sorted(state["files"]):
+                ap = os.path.join(folder, rel)
+                if not os.path.isfile(ap) or wf_sha_file(ap) != state["files"][rel]:
+                    drifted.append(rel)
+        extras = [rel for rel in sorted(have) if rel not in state["files"]]
+        if stamp_ok and not drifted and not extras:
+            note(f"ok {p.id}: verified ({len(state['files'])} file(s))")
+            return True
+        for rel in drifted:
+            wf_park(work, p.id, os.path.join(folder, rel), rel)
+        for rel in extras:
+            wf_park(work, p.id, os.path.join(folder, rel), rel)
+            note(f"STALE   {p.id}: {rel}")
+        note(f"{'REV BUMP' if not stamp_ok else 'REFETCH'}  {p.id}: verified re-extract")
+    else:
+        # single-file shape: a file hashing to the pin sha. Extras in the
+        # folder do not force a refetch — the namespace sweep handles them.
+        target = os.path.join(folder, p.wf_name)
+        if os.path.isfile(target) and not os.path.islink(target):
+            if wf_sha_file(target) == p.sha256:
+                if (os.stat(target).st_mode & 0o777) != 0o444:
+                    os.chmod(target, 0o444)
+                    note(f"PERM    {p.id}: content ok — mode restored 0444")
+                else:
+                    note(f"ok {p.id}: single file verified")
+                return True
+            wf_park(work, p.id, target, p.wf_name)
+            note(f"DRIFT   {p.id}: single file diverged — park + refetch")
+
+    # ---- install (fetch -> sniff -> place/extract) ---------------------------
+    staged = fetch_part(curl_tool, openssl, p, os.path.join(work, "staging"))
+    if staged is None:
+        warn(f"FETCH FAILED {p.id} — tree left in place")
+        return False
+    if zipfile.is_zipfile(staged):
+        man = wf_zip_members(staged)
+        for rel in sorted(have):
+            if rel not in man:
+                wf_park(work, p.id, os.path.join(folder, rel), rel)
+                note(f"STALE   {p.id}: {rel}")
+        # 0444 files cannot be written through even by the owner; verified
+        # replacements free old bytes by unlink (dir write — the namespace
+        # is already widened) before extraction places new ones.
+        for rel in man:
+            ap = os.path.join(folder, rel)
+            if os.path.lexists(ap):
+                os.remove(ap)
+            os.makedirs(os.path.dirname(ap), exist_ok=True)
+        with zipfile.ZipFile(staged) as z:
+            z.extractall(folder)
+        apple = os.path.join(folder, "__MACOSX")
+        if os.path.isdir(apple):
+            shutil.rmtree(apple, ignore_errors=True)
+        for rel in man:
+            ap = os.path.join(folder, rel)
+            if os.path.isfile(ap):
+                os.chmod(ap, 0o444)
+        os.remove(staged)
+        note(f"ZIPDELETE {p.id}: staged zip discarded after extraction")
+        tmp = st_path + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"archive_sha": p.sha256, "files": man}, f, sort_keys=True)
+        os.replace(tmp, st_path)
+        note(f"EXTRACTED {p.id}: {len(man)} file(s); checksum state in .pinwork")
+        return True
+    # plain file: park everything else in the folder, place under wf_name
+    for rel in sorted(have):
+        if rel != p.wf_name:
+            wf_park(work, p.id, os.path.join(folder, rel), rel)
+    target = os.path.join(folder, p.wf_name)
+    if os.path.lexists(target) and not os.path.islink(target):
+        os.remove(target)
+    shutil.copyfile(staged, target)
+    os.chmod(target, 0o444)
+    os.remove(staged)
+    if os.path.isfile(st_path):
+        os.remove(st_path)  # an old zip rev's checksum state no longer applies
+    note(f"FETCHED {p.id}: {target}")
+    return True
+
+
+def wf_namespace_pass(args, pins, failed_ids):
+    """Namespace housekeeping: REMOVED for unclaimed content (nix-owned;
+    bytes stay in the consumer's git history), PRUNE for empty dirs,
+    STATE-DEL for dropped pins, ORPHAN notes for strays (listed, never
+    removed)."""
+    data_dir = os.path.abspath(args.dataDir)
+    work = os.path.join(data_dir, args.work)
+    pins_root = os.path.join(data_dir, args.wfpins)
+    shared = os.path.dirname(pins_root)
+    os.makedirs(pins_root, exist_ok=True)
+    wf_widen(shared)
+    active_safes = set()
+    claimed = set()
+    for p in pins:
+        if p.kind != "workflow":
+            continue
+        active_safes.add(os.path.basename(wf_state_path(work, p.id))[:-5])
+        folder = os.path.join(data_dir, p.dest_rel)
+        if p.id in failed_ids:
+            for dirpath, _dn, files in os.walk(folder):
+                for fn in files:
+                    ap = os.path.join(dirpath, fn)
+                    if os.path.islink(ap) or not os.path.isfile(ap):
+                        continue
+                    claimed.add(os.path.relpath(ap, pins_root))
+            continue
+        st_path = wf_state_path(work, p.id)
+        state = None
+        if os.path.isfile(st_path):
+            try:
+                with open(st_path) as f:
+                    state = json.load(f)
+            except (OSError, ValueError):
+                state = None
+        if state:
+            for rel in state["files"]:
+                ap = os.path.join(folder, rel)
+                if os.path.isfile(ap) and not os.path.islink(ap):
+                    claimed.add(os.path.relpath(ap, pins_root))
+        else:
+            ap = os.path.join(folder, p.wf_name)
+            if os.path.isfile(ap) and not os.path.islink(ap):
+                claimed.add(os.path.relpath(ap, pins_root))
+    for dirpath, _dn, files in os.walk(pins_root):
+        for fn in sorted(files):
+            ap = os.path.join(dirpath, fn)
+            if os.path.islink(ap) or not os.path.isfile(ap):
+                continue
+            if os.path.relpath(ap, pins_root) not in claimed:
+                try:
+                    os.remove(ap)
+                    note(f"REMOVED  {os.path.relpath(ap, pins_root)}: unclaimed pin content (stays in consumer git history)")
+                except OSError as e:
+                    warn(f"remove failed {ap}: {e}")
+    for dirpath, _dn, _fn in os.walk(pins_root, topdown=False):
+        if dirpath != pins_root and not os.listdir(dirpath):
+            os.rmdir(dirpath)
+            note(f"PRUNE   {os.path.relpath(dirpath, pins_root)}: empty pin directory")
+    state_dir = os.path.join(work, "wf-pin-state")
+    if os.path.isdir(state_dir):
+        for fn in sorted(os.listdir(state_dir)):
+            if fn.endswith(".json") and fn[:-5] not in active_safes:
+                try:
+                    os.remove(os.path.join(state_dir, fn))
+                    note(f"STATE-DEL {fn}: dropped pin state")
+                except OSError as e:
+                    warn(f"state cleanup failed {fn}: {e}")
+    for dirpath, dirnames, filenames in os.walk(pins_root):
+        for fn in sorted(dirnames + filenames):
+            ap = os.path.join(dirpath, fn)
+            if os.path.islink(ap) or (not os.path.isdir(ap) and not os.path.isfile(ap)):
+                note(f"ORPHAN  {os.path.relpath(ap, pins_root)}: non-regular entry — listed, never removed")
+    for fn in sorted(os.listdir(shared)):
+        ap = os.path.join(shared, fn)
+        if os.path.isfile(ap) and not os.path.islink(ap):
+            note(f"ORPHAN  {fn}: stray at the managed root — listed, never removed")
+
+
 def cmd_ensure(args):
     """Boot pass as the service user."""
     data_dir = os.path.abspath(args.dataDir)
@@ -382,11 +707,35 @@ def cmd_ensure(args):
     promote = []
     failed = 0
 
+    # Read-only workflow namespace: widen once, sweep + re-seal at the end.
+    # Even when the ensure fails, the mirror unit that follows re-seals the
+    # shared root at its own end.
+    wf_active = bool(args.wfpins) and args.enforce and not args.only
+    if wf_active:
+        shared_root = os.path.dirname(os.path.join(data_dir, args.wfpins))
+        wf_widen(shared_root)
+        os.makedirs(os.path.join(data_dir, args.wfpins), exist_ok=True)
+    wf_failed = []
+
     for p in pins:
         dest_rel = p.dest_rel
         if not dest_rel:
             warn(f"fail {p.id}: manifest entry without dest")
             failed += 1
+            continue
+        if p.kind == "workflow":
+            if not wf_active:
+                warn(f"fail {p.id}: type=workflows entry needs --wfpins, enforcement, and no --only")
+                failed += 1
+            else:
+                try:
+                    if not wf_pin_entry(args, curl_tool, openssl, p):
+                        wf_failed.append(p.id)
+                        failed += 1
+                except Exception as e:
+                    warn(f"fail {p.id}: workflow install crashed: {e!r}")
+                    wf_failed.append(p.id)
+                    failed += 1
             continue
         dest_abs = os.path.join(data_dir, dest_rel)
 
@@ -523,6 +872,14 @@ def cmd_ensure(args):
     with open(tmp, "w") as f:
         json.dump(promote, f, indent=1, sort_keys=True)
     os.replace(tmp, promote_path)
+
+    if wf_active:
+        try:
+            wf_namespace_pass(args, pins, wf_failed)
+        except Exception as e:
+            warn(f"warn: workflow namespace sweep failed: {e!r}")
+        finally:
+            wf_seal(shared_root)
 
     if failed:
         warn(f"ensure: {failed} pin(s) failed")
@@ -674,6 +1031,12 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--link-owner", default="")
     ap.add_argument("--no-enforce", action="store_true")
+    ap.add_argument(
+        "--wfpins",
+        default="",
+        help="dataDir-relative read-only workflow pin namespace "
+        "(e.g. user/default/workflows/nix-managed/pins)",
+    )
     args = ap.parse_args()
     args.enforce = not args.no_enforce
     if args.mode == "ensure":

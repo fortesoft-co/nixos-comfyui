@@ -34,10 +34,14 @@ modules/downloads.nix  pin manifest + pin-plan/pin-seal/pin-audit systemd
                        units around tools/download_runtime.py
                        (content-addressed dataDir/store)
 modules/nodes.nix      opt-in node packs (enable* flags)
-modules/workflows.nix  declarative workflow installation
+modules/workflows.nix  declarative workflow installation (read-only mirror:
+                       repo/ subtree under <workflowsDir>/nix-managed)
 modules/mcp.nix        comfy-mcp + comfy-cli for mcpUsers
 tools/
-download_runtime.py    download runtime (ensure/seal/audit entry points)
+download_runtime.py    download runtime (ensure/seal/audit; type="workflows"
+                       pins land read-only in the pins/ subtree with
+                       per-file checksum state in .pinwork/wf-pin-state)
+workflow_runtime.py    workflow mirror pass (repo/ subtree, 0444/0555)
 workflow_api_to_ui.py  API-format -> UI-format workflow converter (authoring-time)
 ```
 
@@ -76,9 +80,10 @@ mounts, users) go in the consumer, which imports this module and passes
 5. **Conflict-safe everywhere**: the pin-store pipeline never touches
    existing store blobs (placements are by content digest, and drifted
    real files are parked under `.pinwork/quarantine/`, only after their
-   verified replacement is staged); the workflow installer moves a
-   diverged deployed copy aside to `<name>_<timestamp>.json` and installs
-   the repo version. Local edits are never lost, either way.
+   verified replacement is staged); the workflow installer only ever
+   writes inside its mirror namespace (`<workflowsDir>/nix-managed/`,
+   read-only 0444/0555) and never rewrites anything a user can edit.
+   Local edits are never lost.
 6. **Keep host values in the host file.** This folder must stay shippable as
    a standalone module: paths, group, mounts, enable flags belong in the
    consumer.
@@ -126,8 +131,14 @@ mounts, users) go in the consumer, which imports this module and passes
    round-trips UI→API and checks every node against the live server.
 4. Deploy: POST to `/userdata/workflows%2F<subdir>%2F<name>.json`.
 5. Persist into the consumer's workflow directory (e.g. `<workflows>/<name>.json`), `git add`
-   — the `workflowDirs` mapping installs it declaratively on next rebuild
-   (no-clobber: delete the deployed copy first if it changed).
+   — the `workflowDirs` mapping mirrors it read-only into
+   `user/default/workflows/nix-managed/` on next rebuild.
+
+The mirror is enforced by directory modes (files 0444, directories 0555
+   between passes): ComfyUI saves via `mkstemp`+`os.replace`, so sealing
+   the directory is what makes in-place saves of mirror files fail loudly.
+   Anything the mirror previously managed but no longer in the manifest is
+   auto-removed on the next pass.
 
 The converter handles: widget ordering from `input_order`, seed
 `control_after_generate` (appends the control string), GetImageSize-style
@@ -156,6 +167,13 @@ node output type — genuine STRING sockets always declare `forceInput`.
   example workflows, stage them via the downloads option (pinned) — they
   document intended wiring (sampler, guidance, schedulers) better than
   memory.
+- Workflow pins are `type = "workflows"` entries: an optional `dest`
+  folder tail (default: the entry key) plus an optional `name` for the
+  placed file. The artifact installs read-only under
+  `<workflowsDir>/nix-managed/pins/<dest>` — zips are sniffed, extracted
+  and discarded; the sha256 stays the fetch gate. One entry owns one
+  folder; a dropped pin's folder is swept on the next boot (content
+  lives in the consumer git history).
 
 ## Pin store ops
 
@@ -190,6 +208,8 @@ relinked on the next pass, deleted blobs are re-fetched.
 
 ## Gotchas
 
-- Workflow files deployed by the installer that diverge from the repo get
-  moved aside with a timestamp suffix, not overwritten — check for
-  `<name>_<timestamp>.json` sidecars when a "stale" workflow surprises you.
+- ComfyUI's userdata saves are `mkstemp`+`os.replace` — a 0444 file does
+  NOT block them; the 0555 *directory* under
+  `<workflowsDir>/nix-managed/` is the gate. Old timestamped workflow
+  sidecars in `user/workflow-backups/` predate the mirror scheme and can
+  be deleted by hand.
