@@ -2,8 +2,9 @@
 
 Rules and instructions for agents and humans contributing to this
 repository: a standalone NixOS module for declaratively deploying
-ComfyUI — service wiring, opt-in node packs, a hash-pinned download
-fetcher, declarative workflow installation, and MCP tooling.
+ComfyUI — service wiring, opt-in node packs, a content-addressed model
+store (pin-plan/pin-seal/audit), declarative workflow installation, and
+MCP tooling.
 
 ## Content rules (hard — apply to every commit)
 
@@ -29,11 +30,14 @@ it, never reference it from tracked files.
 default.nix            entry point; wires cfg.comfyui onto services.comfyui
 modules/options.nix    cfg.comfyui.* interface (shippable defaults)
 modules/sources.nix    hfFetch / civitaiFetch URL+token constructors
-modules/downloads.nix  comfyui-download-fetch oneshot (no-clobber, resumable)
+modules/downloads.nix  pin manifest + pin-plan/pin-seal/pin-audit systemd
+                       units around tools/download_runtime.py
+                       (content-addressed dataDir/store)
 modules/nodes.nix      opt-in node packs (enable* flags)
 modules/workflows.nix  declarative workflow installation
 modules/mcp.nix        comfy-mcp + comfy-cli for mcpUsers
 tools/
+download_runtime.py    download runtime (ensure/seal/audit entry points)
 workflow_api_to_ui.py  API-format -> UI-format workflow converter (authoring-time)
 ```
 
@@ -63,14 +67,18 @@ mounts, users) go in the consumer, which imports this module and passes
    `models/`, `user/`, `output/` is not. Two clean paths: the ComfyUI HTTP
    API (uploads go through `/upload`, workflows through the userdata API —
    both run as the service user), or a user-supplied sudo command. Never
-   `rm` service files; the no-clobber fetcher + UI tooling are the writers.
+   `rm` service files; the pin-store pipeline (plan/seal) + UI tooling are
+   the writers, and store blobs are root-owned `0444` — a deleted blob is
+   re-downloadable, but never delete on spec.
 4. **Flakes + new files**: after adding anything under a directory the eval
    reads (workflows dir, module files), `git add` before the next
    `nix eval`/rebuild.
-5. **Conflict-safe everywhere**: the fetcher never touches existing files;
-   the workflow installer goes further — if a deployed workflow differs from
-   the repo version, the local copy is moved aside to `<name>_<timestamp>.json`
-   and the repo version installed. Local edits are never lost, either way.
+5. **Conflict-safe everywhere**: the pin-store pipeline never touches
+   existing store blobs (placements are by content digest, and drifted
+   real files are parked under `.pinwork/quarantine/`, only after their
+   verified replacement is staged); the workflow installer moves a
+   diverged deployed copy aside to `<name>_<timestamp>.json` and installs
+   the repo version. Local edits are never lost, either way.
 6. **Keep host values in the host file.** This folder must stay shippable as
    a standalone module: paths, group, mounts, enable flags belong in the
    consumer.
@@ -149,14 +157,19 @@ node output type — genuine STRING sockets always declare `forceInput`.
   document intended wiring (sampler, guidance, schedulers) better than
   memory.
 
-## Fetch service ops
+## Pin store ops
 
-`comfyui-download-fetch.service` runs at boot (and on activation) only. If
-entries were added since the last boot: `sudo systemctl start
-comfyui-download-fetch`. It resumes partial downloads, verifies hashes, and
-**fails as a unit** if any entry cannot be satisfied — a bad pin blocks all
-downstream fetches, so verify hashes before pinning and use `fallbackUrls`
-for fragile sources.
+`comfyui-pin-plan` (boot, service user) relinks and fetches;
+`comfyui-pin-seal` (root, placement + ownership only) lands blobs and
+links; `comfyui-pin-audit` (OnCalendar timer via `auditSchedule`) sweeps
+the whole store and reports orphans. If entries were added since the last
+boot: `sudo systemctl start comfyui-pin-plan` (the seal follows via the
+unit graph; run `sudo systemctl start comfyui-pin-seal` by hand when
+needed). Ensure **fails as a unit** if any pin cannot be satisfied — a bad
+pin blocks the boot pass — so verify hashes before pinning and use
+`fallbackUrls` for fragile sources. Store blobs are root:root 0444 under
+`dataDir/store`; `models/**` entries are absolute symlinks: moved links are
+relinked on the next pass, deleted blobs are re-fetched.
 
 ## Testing loop conventions
 

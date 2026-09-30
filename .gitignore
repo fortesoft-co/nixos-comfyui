@@ -5,3 +5,6 @@ result-*
 .DS_Store
 .scratch/
 
+# Host-specific artifacts (consumer pin dumps — never committed)
+tools/pins.json
+

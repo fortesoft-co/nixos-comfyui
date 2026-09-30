@@ -122,13 +122,15 @@ with lib;
 
     downloads = mkOption {
       description = ''
-        Files fetched into dataDir before the service starts. Keys are paths
-        relative to dataDir (e.g. models/checkpoints/...,
-        user/default/workflows/...); URLs must point at an immutable
-        upstream revision (e.g. an HF commit SHA). Files already present
-        are never overwritten; interrupted downloads resume, finished
-        downloads are verified against sha256 when one is set, and ZIP
-        entries can be extracted with unzipInto.
+        Declaratively-pinned files. Keys are entry ids; each entry resolves
+        its destination via type + arch + name (models/<type>/<arch>/<name>)
+        or an explicit dataDir-relative dest, and names its bytes by their
+        sha256 (content-addressed store). Structured models/** entries land
+        as absolute symlinks into the root-owned dataDir/store; dest-style
+        entries outside models/ and unzipInto bundles keep real-file
+        handling. Existing files are never overwritten; missing content is
+        fetched with resumable curl (tokenFile bearer auth); drift is
+        repaired only after a hash-verified replacement lands.
       '';
       type = types.attrsOf (
         types.submodule {
@@ -138,12 +140,11 @@ with lib;
               default = null;
               description = ''
                 Fetch transport. null fetches `url` with resumable curl;
-                "huggingface" fetches `file` from `repo` at revision `rev`
-                with the hf CLI (xet-aware, gated-repo auth) and falls back
-                to the resolve URL over curl on failure; "civitai" downloads
-                `versionId` (or `file` within the version) through the
-                official civitai CLI and falls back to the download endpoint
-                over resumable curl on failure.
+                "huggingface" resolves
+                https://huggingface.co/<repo>/resolve/<rev>/<file> and
+                "civitai" resolves the model-version download endpoint —
+                both fetched with resumable curl and the entry's tokenFile
+                bearer token (the token covers gated civitai/HF hosts).
               '';
             };
             repo = mkOption {
@@ -263,11 +264,12 @@ with lib;
       type = types.bool;
       default = true;
       description = ''
-        Enforce pinned destinations. On every boot: pinned files that went
-        missing are restored from a same-filesystem stray copy (size- and
-        sha256-verified) when one exists, files whose size changed versus
-        the last verified state are repaired, and plain fetches only run
-        for genuinely missing content.
+        Enforce pinned destinations. When true, the boot pass reconciles
+        them: wrong or missing links to existing store blobs are relinked,
+        and a drifted real file is parked (quarantined) only after its
+        verified replacement is staged. When false, existing files/links at
+        pinned paths are reported and left exactly as found — the fetch +
+        seal pass that places missing content still runs.
       '';
     };
 
@@ -275,12 +277,11 @@ with lib;
       type = with types; nullOr str;
       default = null;
       description = ''
-        systemd OnCalendar schedule for <target>-download-audit — a full
-        sha256 sweep over pinned entries (mtime+size manifest-skipped) with
-        stray-rescue and repair: moved files restored in place, hash
-        mismatches refetched after the local impostor is removed (only once
-        the replacement is hash-verified), everything logged. null disables
-        the unit. Example: "weekly" or "Sun 05:00".
+        systemd OnCalendar schedule for <target>-pin-audit — the boot
+        ensure pass plus a full sweep of the store (every blob re-measured
+        against the digest embedded in its name); orphans and unrecognized
+        files are listed, never deleted. null disables the unit and timer.
+        Example: "weekly" or "Sun *-01..07 05:00".
       '';
     };
   };

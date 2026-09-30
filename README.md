@@ -2,7 +2,7 @@
 
 A declarative ComfyUI stack wrapping the native NixOS module from
 [github:utensils/comfyui-nix](https://github.com/utensils/comfyui-nix): the
-service, its data layout, hash-pinned model downloads, opt-in custom node
+service, its data layout, a content-addressed model store, opt-in custom node
 packs, declarative workflows, and MCP tooling — all pinned, no runtime pip
 installs, no host assumptions baked into the module.
 
@@ -13,7 +13,7 @@ installs, no host assumptions baked into the module.
 | `default.nix` | Orchestration module: wires the cfg.comfyui interface onto `services.comfyui`, imports everything below. The only entry point. |
 | `modules/options.nix` | `cfg.comfyui.*` options (generic defaults — this folder ships as a module) |
 | `modules/sources.nix` | Fetch-entry constructors: `hfFetch` (HF repo+rev+file) and `civitaiFetch` (civitai versionId), each injecting the right token |
-| `modules/downloads.nix` | Oneshot fetch service: pulls `cfg.comfyui.downloads` into `dataDir` before the service starts. Idempotent (never overwrites), resumable, sha256-verified, supports mirrors + ZIP extraction |
+| `modules/downloads.nix` | Pin-store units (`pin-plan`/`pin-seal`/`pin-audit`) around `tools/download_runtime.py`: content-addressed `dataDir/store`, boot relink/fetch pass, root placement, audit timer |
 | `modules/nodes.nix` | Opt-in custom node packs (see below), merged into `services.comfyui.customNodes` |
 | `modules/workflows.nix` | Declarative workflow installation (`workflows` attrset + `workflowDirs` directory mapping) |
 | `modules/mcp.nix` | Comfy Org's MCP server + comfy-cli on `mcpUsers`' PATH |
@@ -40,11 +40,14 @@ cfg.comfyui = {
   enableLoraManager = true;
   enableCrystools = true;
   downloads = {
-    "models/checkpoints/some-model.safetensors" = civitaiFetch {
+    "some-model" = civitaiFetch {
+      type = "checkpoints";
+      name = "some-model.safetensors";
       versionId = "123456";
       sha256 = "...";
     };
-    "models/loras/some-lora.safetensors" = hfFetch {
+    "some-lora" = hfFetch {
+      type = "loras";
       repo = "some/repo";
       rev = "<commit sha>";
       file = "some-lora.safetensors";
@@ -95,26 +98,42 @@ When this repository is published, the same input becomes a
 | `enableLoraManager` | `false` | LoRA Manager model-library UI at `/loras` |
 | `enableCrystools` | `false` | GPU/RAM monitors + utility nodes |
 | `civitaiApiKeyFile` / `huggingfaceTokenFile` | `null` | Paths to token files (any mechanism — e.g. agenix-decrypted secrets), wired to the fetcher + service env |
-| `downloads` | `{}` | `dataDir path → { url, sha256, fallbackUrls, tokenFile, unzipInto }` |
+| `downloads` | `{}` | Declarative pins (id-keyed; see Downloads) |
 | `workflowsDir` | `user/default/workflows` | Install root for declarative workflows |
 | `workflows` | `{}` | Explicit workflow files (`dataDir path → store path`) |
 | `workflowDirs` | `[]` | Directories mapped wholesale under `workflowsDir` |
 
 ## Downloads
 
-`modules/sources.nix` builds pinned URLs and injects the right token per source:
+Pins live in the consumer's host file. Two destination styles per entry:
 
-- `hfFetch { repo, rev, file, sha256 }` — HuggingFace file pinned to a commit
-  SHA; the HF token covers gated repos and is harmless elsewhere.
-- `civitaiFetch { versionId, sha256 }` — civitai model version; the key is a
-  bearer token on the initial request only (the CDN redirect is signed).
+- **structured** (`type`/`arch`/`name`, or an explicit `dataDir`-relative
+  `dest` under `models/`) — the bytes land in a root-owned,
+  content-addressed store (`dataDir/store/<stem>--<sha256><ext>`, mode
+  0444) and the `models/**` entry is an absolute symlink into it;
+- **real-file** (`dest` entries outside `models/`, and `unzipInto`
+  bundles) — fetched straight to the destination, ZIPs extracted into a
+  checksummed tree that is re-verified on each pass.
+
+`modules/sources.nix` builds pinned URLs and injects the right token per
+source (fetched with resumable curl):
+
+- `hfFetch { repo, rev, file, sha256 }` — HuggingFace resolve URL pinned to
+  a commit SHA; the HF token covers gated repos and is harmless elsewhere.
+- `civitaiFetch { versionId, sha256 }` — the model-version download
+  endpoint; the key is a bearer token on the initial request only (the CDN
+  redirect is signed).
 - Plain `{ url, sha256 }` attrsets work for arbitrary hosts.
 
-Semantics: existing files are **never overwritten**, downloads resume, hashes
-verify when provided, `fallbackUrls` keep entries alive when upstream
-disappears, `unzipInto` extracts ZIP packs. The fetcher is a oneshot
-(`comfyui-download-fetch.service`) that runs before the service; if it is
-skipped mid-session, run `systemctl start comfyui-download-fetch` manually.
+Semantics: existing files are **never overwritten** (the seal is the only
+placement, and it parks a drifted file in quarantine instead of destroying
+it), downloads resume, every pin is sha256-gated, `fallbackUrls` keep
+entries alive when upstream disappears, `unzipInto` extracts ZIP packs.
+Three systemd units do the work: `comfyui-pin-plan` (boot pass as the
+service user — relink, fetch, promote), `comfyui-pin-seal` (root oneshot —
+measures, places, owns, links) and `comfyui-pin-audit` (OnCalendar timer,
+via `auditSchedule` — full store sweep + orphan report). Re-run the boot
+pass mid-session with `sudo systemctl start comfyui-pin-plan`.
 
 ## Workflows
 
@@ -165,5 +184,7 @@ see `AGENTS.md` for the tooling rules (lifecycle stays with systemd).
   github:<owner>/<repo>` prints the hash).
 - New downloads: `git add` new files before evaluating (flakes only see
   tracked files).
-- The fetcher's no-clobber rule means a removed entry leaves its file on
-  disk; a changed hash on an existing file requires deleting the file first.
+- Removed `downloads` entries leave their content in place (a store blob
+  without a pin becomes an audit-reported orphan, never deleted); replacing
+  a pin's bytes requires deleting the store blob (root) first — placement
+  never overwrites.

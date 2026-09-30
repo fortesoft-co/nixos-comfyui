@@ -90,7 +90,7 @@ in
     (lib.mkIf (cfg.workflows != { }) {
       systemd.services.comfyui-workflows-install = {
         description = "Install declarative ComfyUI workflows";
-        after = [ "comfyui-download-fetch.service" ] ++ cfg.requiresMounts;
+        after = [ "comfyui-pin-seal.service" ] ++ cfg.requiresMounts;
         before = [ "comfyui.service" ];
         wantedBy = [ "multi-user.target" ];
         serviceConfig = {
