@@ -99,6 +99,82 @@ with lib;
       '';
     };
 
+    enablePanicTitanGallery = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Install PanicTitan ComfyUI-Gallery: a real-time output gallery
+        popup inside the frontend (menu button / Ctrl+G) — folder tree,
+        search/sort, metadata inspection + raw JSON, move/delete/download
+        and batch operations, image/video/GIF/audio/3D display. Its
+        settings file (pack-root user_settings.json, written on save) is
+        symlinked into <dataDir>/<panicTitanGallerySubdir> — host-writable
+        state, not nix.
+      '';
+    };
+
+    panicTitanGallerySubdir = mkOption {
+      type = types.str;
+      default = "user/panictitan-gallery";
+      description = ''
+        dataDir-relative runtime directory holding
+        ComfyUI-Gallery's user_settings.json.
+      '';
+    };
+
+    tokenSpenderSidebarGallerySubdir = mkOption {
+      type = types.str;
+      default = "user/sidebar-gallery";
+      description = ''
+        dataDir-relative runtime directory holding TokenSpender
+        ComfyUI-Sidebar-Gallery's settings json (sidebar_gallery_config.json),
+        its SQLite index (sidebar_gallery_cache.db) and the .thumbs
+        thumbnail cache.
+      '';
+    };
+
+    enableTokenSpenderSidebarGallery = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Install TokenSpender ComfyUI-Sidebar-Gallery: a media browser in
+        the ComfyUI sidebar — a persistent SQLite index of the output (and
+        extra) folders, embedded generation metadata shown in a searchable
+        structured panel (workflow-graph parsing: seed-from-primitive
+        resolution, Wan 2.2 MoE high/low pairing, enhanced-vs-original
+        prompts), field-prefixed search, a layout editor with named
+        presets, workflow loading by dragging thumbnails. Its three
+        pack-root runtime items (settings json, cache db, .thumbs) are
+        symlinked into <dataDir>/<tokenSpenderSidebarGallerySubdir> —
+        host-writable state, not nix.
+      '';
+    };
+
+    enableComfyAssetsPromptManager = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Install ComfyUI PromptManager: a CLIPTextEncode drop-in that
+        auto-saves every prompt it encodes to SQLite (sha256-deduped),
+        links generated images to prompts, and serves an admin dashboard
+        with search, ratings, tags, gallery and export at
+        /prompt_manager/admin. Its database, config.json and logs live
+        under <dataDir>/<comfyAssetsPromptManagerSubdir> — host-writable
+        state, never
+        inside nix or any repo.
+      '';
+    };
+
+    comfyAssetsPromptManagerSubdir = mkOption {
+      type = types.str;
+      default = "user/prompt-manager";
+      description = ''
+        dataDir-relative runtime directory for PromptManager — holds
+        prompts.db, config.json (seeded, then user-editable through the
+        pack-side symlink) and its logs.
+      '';
+    };
+
     civitaiApiKeyFile = mkOption {
       type = with types; nullOr str;
       default = null;

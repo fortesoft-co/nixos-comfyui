@@ -1,5 +1,5 @@
-# Custom node defaults for the module: the flake's bundled set plus three
-# opt-in packs, each behind a cfg.comfyui option (all default false):
+# Custom node defaults for the module: the flake's bundled set plus opt-in
+# packs, each behind a cfg.comfyui option (all default false):
 #   civitai-comfy-nodes — official Civitai pack (in-graph model downloads)
 #   lora-manager        — model library UI at /loras (civitai previews,
 #                         trigger words, example prompts; resolves metadata
@@ -7,6 +7,17 @@
 #                         automatically)
 #   comfyui-crystools   — GPU/RAM menu-bar monitors, progress bars, metadata
 #                         viewer/comparator and misc utility nodes
+#   prompt-manager      — prompt auto-capture to SQLite (CLIPTextEncode
+#                         drop-in, /prompt_manager/admin dashboard,
+#                         PromptSearchList batch node); DB/config/logs
+#                         live under <dataDir>/<comfyAssetsPromptManagerSubdir>
+#   comfyui-gallery     — real-time output gallery popup (PanicTitan:
+#                         folder tree, metadata/batch ops); settings file
+#                         symlinked under <dataDir>/<panicTitanGallerySubdir>
+#   sidebar-gallery     — sidebar media browser (TokenSpender: SQLite
+#                         index + workflow-graph metadata parser);
+#                         config/cache/thumbs symlinked under
+#                         <dataDir>/<tokenSpenderSidebarGallerySubdir>
 # Host-specific nodes are declared by the consumer:
 # services.comfyui.customNodes is an attrset, so entries merge.
 {
@@ -17,6 +28,26 @@
 }:
 let
   cfg = config.cfg.comfyui;
+
+  # ComfyUI PromptManager (enableComfyAssetsPromptManager): its runtime writes are
+  # repointed under this host-writable dir — prompts.db (absolute path via
+  # the seeded config.json), config.json itself (symlinked so dashboard
+  # settings persist), logs (symlink; the pack opens its rotating file
+  # handler at import time, so the target must pre-exist) and data/
+  # (symlink; LoRA-image import cache). Pre-created via tmpfiles below.
+  promptManagerRuntimeDir = "${cfg.dataDir}/${cfg.comfyAssetsPromptManagerSubdir}";
+  promptManagerConfigSeed = pkgs.writeText "prompt-manager-config.json" (
+    builtins.toJSON {
+      database.default_path = "${promptManagerRuntimeDir}/prompts.db";
+    }
+  );
+
+  # PanicTitan ComfyUI-Gallery (enablePanicTitanGallery): settings-file symlink home
+  galleryRuntimeDir = "${cfg.dataDir}/${cfg.panicTitanGallerySubdir}";
+
+  # TokenSpender Sidebar Gallery (enableTokenSpenderSidebarGallery): its
+  # three pack-root runtime items (settings json, cache.db, .thumbs) live here
+  sidebarGalleryRuntimeDir = "${cfg.dataDir}/${cfg.tokenSpenderSidebarGallerySubdir}";
 in
 {
   services.comfyui = {
@@ -71,6 +102,134 @@ in
           hash = "sha256-IvLgvudqJV6QeNxwA3HbIlGxShCfUBBSZ8DSjOVlSyE=";
         };
       })
+
+      # ComfyUI Prompt Manager: a CLIPTextEncode drop-in that auto-captures
+      # every prompt it encodes into SQLite (sha256-deduped), links output
+      # images via file monitoring, and serves an admin dashboard at
+      # /prompt_manager/admin (search/ratings/tags/gallery/export);
+      # PromptSearchList re-emits stored prompts as a list for batches.
+      # Upstream defaults write into the pack directory (prompts.db,
+      # config.json on settings saves, logs/ at import time, data/ for
+      # LoRA-image import), which is a read-only store path here — so wrap
+      # the fetch in runCommand and repoint all four:
+      #   config.json — symlink to <subdir>/config.json, seeded once by a
+      #     tmpfiles C rule; settings saves write *through* the symlink and
+      #     survive restarts.
+      #   logs / data — symlinks to <subdir>/<logs,data>, pre-created by
+      #     tmpfiles because the rotating file handler opens at import.
+      #   prompts.db — absolute path inside the seeded config.json; the
+      #     pack creates parent dirs itself (operations.py makedirs).
+      # Gallery thumbnails land in <outputDir>/thumbnails (writable), not
+      # the pack. The LoRA Manager integration (off by default) reads LM's
+      # .metadata.json files in memory and downloads Civitai previews into
+      # data/lora_images via the symlink — its CivitAI key is typed once in
+      # the Settings panel and now persists. AI AutoTag downloads WD14/
+      # JoyCaption models on first use — untested on Nix, leave off.
+      (lib.mkIf cfg.enableComfyAssetsPromptManager {
+        prompt-manager = pkgs.runCommand "ComfyUI_PromptManager" {
+          preferLocalBuild = true;
+        } ''
+          cp -r ${
+            pkgs.fetchFromGitHub {
+              owner = "ComfyAssets";
+              repo = "ComfyUI_PromptManager";
+              rev = "d70dab56e5fb67c3e471607bc10984975c4cc2aa";
+              hash = "sha256-8XiFty1OQ0uP09PGQMuxkFg86aYWW/X6UkGwFWfKOD4=";
+            }
+          } $out
+          chmod -R u+w $out  # fetchFromGitHub copies as read-only
+          # Upstream _resolve_db_path (database/operations.py) imports
+          # py.config absolutely, which sys.path-resolves against OTHER node
+          # packs' py/ dirs (e.g. LoRA Manager loads first alphabetically)
+          # and on failure silently falls back to a relative prompts.db
+          # resolved against the extension root — i.e. through the
+          # custom_nodes/ symlink into the READ-ONLY store: sqlite
+          # CANTOPEN at import, API routes + image monitor never start.
+          # Patch: prefer the correct relative-package import; env-var
+          # fallback covers non-package module loading. Guarded by greps so
+          # the build fails loudly if upstream changes the text.
+          sed -i "s|from py.config import PromptManagerConfig|from ..py.config import PromptManagerConfig|" $out/database/operations.py
+          sed -i "s|db_path = \"prompts.db\"|db_path = os.environ.get(\"PROMPT_MANAGER_DB_PATH\", \"prompts.db\")|" $out/database/operations.py
+          grep -q "from ..py.config import PromptManagerConfig" $out/database/operations.py
+          grep -q "os.environ.get(\"PROMPT_MANAGER_DB_PATH\"" $out/database/operations.py
+          ln -s ${promptManagerRuntimeDir}/logs $out/logs
+          ln -s ${promptManagerRuntimeDir}/config.json $out/config.json
+          ln -s ${promptManagerRuntimeDir}/data $out/data
+        '';
+      })
+
+      # PanicTitan ComfyUI-Gallery: real-time output gallery popup inside
+      # the frontend (menu button / Ctrl+G) — folder tree, search/sort,
+      # metadata inspect + raw JSON, move/delete/download/batch-ZIP, and
+      # image/video/GIF/audio/3D support. Updates land via comfy's event
+      # system + watchdog; scans folder_paths' output dir; serves media
+      # read-only via a /static_gallery static route.
+      # Nix treatment is lighter than PromptManager's: the ONLY pack-dir
+      # write is user_settings.json, and only on settings SAVE (not at
+      # import) — so the dangling symlink at load is harmless (defaults
+      # used), and the first save lands in the tmpfiles-created runtime
+      # dir, persisting across restarts. Audit found no other writes, so
+      # no grep guards are needed here.
+      # Upstream note: FileSystemMonitor constructs PollingObserver when
+      # use_polling_observer is False (default) — the flag's naming is
+      # inverted upstream, still functional (polling at 1s); report vs
+      # patch.
+      (lib.mkIf cfg.enablePanicTitanGallery {
+        panictitan-gallery = pkgs.runCommand "ComfyUI-Gallery" {
+          preferLocalBuild = true;
+        } ''
+          cp -r ${
+            pkgs.fetchFromGitHub {
+              owner = "PanicTitan";
+              repo = "ComfyUI-Gallery";
+              rev = "74639e68846f64c9f561f3a7745529de76376a97";
+              hash = "sha256-8/pC0vF00JiKhublrXrGYdpL4dpOXK459inlHb/nZoA=";
+            }
+          } $out
+          chmod -R u+w $out  # fetchFromGitHub copies as read-only
+          ln -s ${galleryRuntimeDir}/user_settings.json $out/user_settings.json
+        '';
+      })
+
+      # TokenSpender ComfyUI-Sidebar-Gallery: sidebar media browser with a
+      # persistent SQLite index (sidebar_gallery_cache.db: file listing +
+      # parsed metadata summaries; layouts/presets live server-side there
+      # too, per-browser extras in localStorage) and a workflow-graph
+      # metadata parser (resolves seed-from-primitive, pairs Wan 2.2 MoE
+      # high/low passes, separates enhanced vs original prompts).
+      # Audit found exactly three pack-root runtime writes, one of them a
+      # load-killer:
+      #   .thumbs/           — thumbnail cache; mkdir(exist_ok=True) at
+      #                        routes.py import → EROFS on a store path →
+      #                        symlink to a pre-created dir (tmpfiles)
+      #   sidebar_gallery_config.json — settings save + manual extra_roots
+      #                        edits (extra folders come ONLY from editing
+      #                        this file); load uses path.exists() →
+      #                        defaults, so a dangling link is harmless
+      #   sidebar_gallery_cache.db    — created by sqlite on open; WAL
+      #                        sidecars land beside it (contained in the
+      #                        runtime dir)
+      # Deps: av (PyAV) is imported lazily and guarded in routes.py/
+      # metadata.py — it is ABSENT from the core env, so video/audio
+      # metadata degrades silently without ps.av; we add it.
+      (lib.mkIf cfg.enableTokenSpenderSidebarGallery {
+        tokenspender-sidebar-gallery = pkgs.runCommand "ComfyUI-Sidebar-Gallery" {
+          preferLocalBuild = true;
+        } ''
+          cp -r ${
+            pkgs.fetchFromGitHub {
+              owner = "TokenSpender";
+              repo = "ComfyUI-Sidebar-Gallery";
+              rev = "07e1d0e8b69f939ff52b964f812818b5ee6b7c96";
+              hash = "sha256-HxvGBFB19ioZOujJ4Q6hUMEAwjDVV7iIKH94bQSkv74=";
+            }
+          } $out
+          chmod -R u+w $out  # fetchFromGitHub copies as read-only
+          ln -s ${sidebarGalleryRuntimeDir}/sidebar_gallery_config.json $out/sidebar_gallery_config.json
+          ln -s ${sidebarGalleryRuntimeDir}/sidebar_gallery_cache.db $out/sidebar_gallery_cache.db
+          ln -s ${sidebarGalleryRuntimeDir}/.thumbs $out/.thumbs
+        '';
+      })
     ];
 
     # Python deps: socketio (client) for the Civitai pack; the second list is
@@ -101,13 +260,57 @@ in
         ps.pynvml
         ps.py-cpuinfo
         ps.piexif
+      ]
+      # comfyassets-promptmanager: output file monitoring (Pillow already in core env)
+      ++ lib.optional cfg.enableComfyAssetsPromptManager ps.watchdog
+      # gallery: watchdog monitoring + piexif EXIF extraction (redundant
+      # entries are deduped by the python env)
+      ++ lib.optionals cfg.enablePanicTitanGallery [
+        ps.watchdog
+        ps.piexif
+      ]
+      # sidebar-gallery: video/audio container metadata via PyAV (lazy-
+      # imported; absent from core env otherwise)
+      ++ lib.optionals cfg.enableTokenSpenderSidebarGallery [
+        ps.av
       ];
 
     # Point the pack's stored-key path at the agenix-decrypted file when
     # provided — its reads treat the file's contents as the API key, so the
     # interactive sidebar sign-in is never needed.
-    environment = lib.mkIf (cfg.enableCivitaiNodes && cfg.civitaiApiKeyFile != null) {
-      CIVITAI_COMFY_API_KEY_STORE = cfg.civitaiApiKeyFile;
-    };
+    environment = lib.mkMerge [
+      (lib.mkIf (cfg.enableCivitaiNodes && cfg.civitaiApiKeyFile != null) {
+        CIVITAI_COMFY_API_KEY_STORE = cfg.civitaiApiKeyFile;
+      })
+      (lib.mkIf cfg.enableComfyAssetsPromptManager {
+        # DB-path fallback for prompt-manager (see the customNodes entry:
+        # upstream's absolute py.config import can bind a foreign pack's
+        # py/ and silently fall back to the store path).
+        PROMPT_MANAGER_DB_PATH = "${promptManagerRuntimeDir}/prompts.db";
+      })
+    ];
   };
+
+  # Runtime dirs (see the customNodes entries): tmpfiles completes before
+  # the service starts, so every pack's symlink targets and import-time
+  # writes find writable paths. PM's C rule seeds config.json only when
+  # missing — settings saved through the pack-side symlink survive
+  # reboots. The gallery has no seed on purpose: its dangling
+  # user_settings.json link reads as {} defaults until the first settings
+  # save lands through it.
+  systemd.tmpfiles.rules = lib.concatLists [
+    (lib.optionals cfg.enableComfyAssetsPromptManager [
+      "d ${promptManagerRuntimeDir} 0755 ${cfg.user} ${cfg.group} -"
+      "d ${promptManagerRuntimeDir}/logs 0755 ${cfg.user} ${cfg.group} -"
+      "d ${promptManagerRuntimeDir}/data 0755 ${cfg.user} ${cfg.group} -"
+      "C ${promptManagerRuntimeDir}/config.json 0644 ${cfg.user} ${cfg.group} - ${promptManagerConfigSeed}"
+    ])
+    (lib.optionals cfg.enablePanicTitanGallery [
+      "d ${galleryRuntimeDir} 0755 ${cfg.user} ${cfg.group} -"
+    ])
+    (lib.optionals cfg.enableTokenSpenderSidebarGallery [
+      "d ${sidebarGalleryRuntimeDir} 0755 ${cfg.user} ${cfg.group} -"
+      "d ${sidebarGalleryRuntimeDir}/.thumbs 0755 ${cfg.user} ${cfg.group} -"
+    ])
+  ];
 }
