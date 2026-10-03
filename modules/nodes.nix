@@ -18,6 +18,11 @@
 #                         index + workflow-graph metadata parser);
 #                         config/cache/thumbs symlinked under
 #                         <dataDir>/<tokenSpenderSidebarGallerySubdir>
+#   majoor-assets       — Majoor Assets Manager (media library, Floating
+#                         Viewer, Graph Map, save nodes w/ embedded
+#                         generation timing; all state in
+#                         <output>/_mjr_index/ — no pack writes, no
+#                         wrapper)
 # Host-specific nodes are declared by the consumer:
 # services.comfyui.customNodes is an attrset, so entries merge.
 {
@@ -230,6 +235,35 @@ in
           ln -s ${sidebarGalleryRuntimeDir}/.thumbs $out/.thumbs
         '';
       })
+
+      # Majoor Assets Manager: in-ComfyUI media library (Vue 3/TS UI) with
+      # deep workflow inspection (Graph Map: readable subgraphs, node
+      # detail/copy/import), Floating Viewer (live stream, A/B + side-by-
+      # side + grid compare, KSampler/node streams), a workflow-tab
+      # library (categories/tags/thumbnails), collections/tags/ratings,
+      # and its own save nodes that embed generation_time_ms + prompt +
+      # workflow into saved PNGs and MP4s (PyAV movflags) — which improves
+      # video metadata indexing for every gallery here, not only its own.
+      # NO wrapper: per its Data Locations table ALL runtime state is
+      # <output>/_mjr_index/ (assets.sqlite, collections/, custom_roots)
+      # + <output>/_mjr_batch_zips/; browser settings are localStorage —
+      # zero pack-dir writes (the first pack in this stack needing only a
+      # plain fetch). Optional exiftool/ffprobe are not in PATH: the
+      # pure-python hachoir fallback covers audio/video probing.
+      # Notes: the write-guard blocks writes when the UI is opened via a
+      # LAN IP unless configured (Settings -> Security -> Recommended
+      # Remote LAN Setup); the index artifacts inside output/ may be swept
+      # by the other galleries' recursive scans (check after install);
+      # AI/vector extras (requirements-vector.txt) intentionally not
+      # installed.
+      (lib.mkIf cfg.enableMajoorAssetsManager {
+        majoor-assets = pkgs.fetchFromGitHub {
+          owner = "MajoorWaldi";
+          repo = "ComfyUI-Majoor-AssetsManager";
+          rev = "3618a2048102e2c5818fa4d3497f8c3898664d5b";
+          hash = "sha256-jiyYgSsD/yz3D+InybifumMkR0vDAsFSW7ahH/gQm6k=";
+        };
+      })
     ];
 
     # Python deps: socketio (client) for the Civitai pack; the second list is
@@ -273,6 +307,18 @@ in
       # imported; absent from core env otherwise)
       ++ lib.optionals cfg.enableTokenSpenderSidebarGallery [
         ps.av
+      ]
+      # majoor-assets: deps listed here so the pack stays independent of
+      # other packs' toggles (av/aiosqlite/watchdog overlap them but are
+      # deduped); hachoir = pure-python probe fallback for missing
+      # exiftool/ffprobe; blake3 = core asset-id hashing
+      ++ lib.optionals cfg.enableMajoorAssetsManager [
+        ps.av
+        ps.aiosqlite
+        ps.watchdog
+        ps.hachoir
+        ps.send2trash
+        ps.blake3
       ];
 
     # Point the pack's stored-key path at the agenix-decrypted file when

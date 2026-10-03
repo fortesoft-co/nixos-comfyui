@@ -150,6 +150,22 @@ with lib;
       '';
     };
 
+    enableMajoorAssetsManager = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Install Majoor Assets Manager: an in-ComfyUI media library (Vue 3
+        UI) — browsable outputs/inputs/collections, full-text search +
+        filters, the Floating Viewer (live streams, A/B / side-by-side
+        compare), Graph Map workflow inspection, a workflow-tab library,
+        rating/tag/collection management, and save nodes that embed
+        generation_time_ms + prompt + workflow into saved PNG/MP4 files.
+        All runtime state lives under the output directory
+        (<output>/_mjr_index/) — zero pack-dir writes, so this installs
+        as a plain fetched source with no wrapper.
+      '';
+    };
+
     enableComfyAssetsPromptManager = mkOption {
       type = types.bool;
       default = false;
