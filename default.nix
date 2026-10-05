@@ -8,6 +8,8 @@
 #     ./modules/sources.nix)
 #   - custom node declarations (./modules/nodes.nix)
 #   - declarative workflow installation (./modules/workflows.nix)
+#   - read-only store reporting + civitai update checks
+#     (./modules/reporting.nix around tools/report_runtime.py)
 #
 # No host assumptions live here: machine-specific values (dataDir, mounts,
 # group, enable flags) are set by the consumer — a consumer module that
@@ -31,6 +33,7 @@ in
     ./modules/downloads.nix
     ./modules/nodes.nix
     ./modules/workflows.nix
+    ./modules/reporting.nix
   ];
 
   # ComfyUI binary cache (https://github.com/utensils/comfyui-nix), mostly for

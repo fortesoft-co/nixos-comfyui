@@ -37,10 +37,18 @@ modules/nodes.nix      opt-in node packs (enable* flags)
 modules/workflows.nix  declarative workflow installation (read-only mirror:
                        repo/ subtree under <workflowsDir>/nix-managed)
 modules/mcp.nix        comfy-mcp + comfy-cli for mcpUsers
+modules/reporting.nix  read-only store reporting + civitai update
+                       checker (tools/report_runtime.py); drops
+                       <dataDir>/bin/comfyui-report, a tmpfiles symlink
+                       recreated at every rebuild (dataDir-owned tree —
+                       tmpfiles cannot place anything under the
+                       root-owned store/)
 tools/
 download_runtime.py    download runtime (ensure/seal/audit; type="workflows"
                        pins land read-only in the pins/ subtree with
                        per-file checksum state in .pinwork/wf-pin-state)
+report_runtime.py      read-only reporting/update checker (report |
+                       updates subcommands; api GETs only, never writes)
 workflow_runtime.py    workflow mirror pass (repo/ subtree, 0444/0555)
 workflow_api_to_ui.py  API-format -> UI-format workflow converter (authoring-time)
 ```
@@ -187,7 +195,12 @@ needed). Ensure **fails as a unit** if any pin cannot be satisfied — a bad
 pin blocks the boot pass — so verify hashes before pinning and use
 `fallbackUrls` for fragile sources. Store blobs are root:root 0444 under
 `dataDir/store`; `models/**` entries are absolute symlinks: moved links are
-relinked on the next pass, deleted blobs are re-fetched.
+relinked on the next pass, deleted blobs are re-fetched. Seal also
+re-asserts 0444 root:root across the store on every pass.
+
+Store reporting: `<dataDir>/bin/comfyui-report report|updates` —
+read-only, no sudo; `updates` paces civitai API reads, honors 429/Retry-After,
+and can print drop-in `civitaiFetch` entries (`--nix-snippets`).
 
 ## Testing loop conventions
 

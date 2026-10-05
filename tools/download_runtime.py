@@ -39,8 +39,10 @@ One binary, three subcommands, three units:
         consumes promote.json: re-measures every row's bytes, places them
         into <store>/<name>--<digest><ext> (0444, root:root), writes the
         .pin.json provenance freebie + store README, creates the
-        semantic symlink. Root performs placement + ownership only — no
-        network I/O.
+        semantic symlink, and walks the store to re-assert 0444
+        root:root over blobs/sidecars/README (stores written by earlier
+        pipeline versions may still carry service-user ownership).
+        Root performs placement + ownership only — no network I/O.
     <bin> audit   --manifest pins.json ...    (comfyui, quarterly timer)
         everything ensure does, plus a full sweep of the store: every
         blob is re-measured and must hash to its embedded digest; blobs
@@ -74,7 +76,7 @@ import sys
 import urllib.parse
 import zipfile
 
-VERSION = "download_runtime 1.3"
+VERSION = "download_runtime 1.4"
 
 CURL_CANDIDATES = ["curl"]
 OPENSSL_CANDIDATES = ["openssl"]
@@ -298,6 +300,49 @@ def make_link(pin_id, link_abs, blob_path, uid=None, gid=None):
         return
     os.replace(tmp, link_abs)
     note(f"LINKED  {pin_id}: {link_abs} -> {blob_path}")
+
+
+def normalize_store(store_dir):
+    """Re-assert the store's mode/ownership law over existing content:
+    blobs, sidecars and the README are 0444 root:root. Placement-time
+    chowning only covered freshly promoted rows, so stores written by
+    earlier pipeline versions can still carry service-user-owned blobs;
+    every seal pass walks the tree and fixes mode/ownership. Never
+    renames or deletes anything."""
+    if not os.path.isdir(store_dir):
+        return
+    fixed = 0
+    for name in sorted(os.listdir(store_dir)):
+        path = os.path.join(store_dir, name)
+        if name == "bin" or os.path.islink(path) or not os.path.isfile(path):
+            continue
+        is_readme = name == "README.md"
+        is_sidecar = name.endswith(".pin.json")
+        is_blob = BLOB_RE.match(name) is not None
+        if not (is_readme or is_sidecar or is_blob):
+            continue
+        try:
+            st = os.lstat(path)
+        except OSError as e:
+            warn(f"normalize: stat failed {path}: {e}")
+            continue
+        can_writemode = is_root() or st.st_uid == os.geteuid()
+        if is_root() and (st.st_uid != 0 or st.st_gid != 0):
+            try:
+                os.chown(path, 0, 0)
+                note(f"NORMALIZED {name}: chown 0:0")
+                fixed += 1
+            except OSError as e:
+                warn(f"normalize {name}: chown failed: {e}")
+        if can_writemode and (st.st_mode & 0o777) != 0o444:
+            try:
+                os.chmod(path, 0o444)
+                note(f"NORMALIZED {name}: chmod 0444")
+                fixed += 1
+            except OSError as e:
+                warn(f"normalize {name}: chmod failed: {e}")
+    if fixed:
+        note(f"seal: normalized {fixed} store file(s) (mode/ownership)")
 
 
 def unzip_bundle(openssl, archive, into_dir, archive_sha):
@@ -911,6 +956,7 @@ def cmd_seal(args):
         note("seal: no promote.json — nothing to do")
         os.makedirs(store_dir, exist_ok=True)
         write_store_readme(store_dir)
+        normalize_store(store_dir)
         return 0
     with open(promote_file) as f:
         rows = json.load(f)
@@ -979,6 +1025,7 @@ def cmd_seal(args):
             write_sidecar(blob, row.get("provenance"), pin_id)
             note(f"PLACED {pin_id}: {blob}")
         make_link(pin_id, link, blob, link_uid, link_gid)
+    normalize_store(store_dir)
     try:
         os.remove(promote_file)
     except OSError as e:
@@ -1005,6 +1052,18 @@ def cmd_audit(args):
         if measured != dig:
             warn(f"audit FAILED: {path_} hashes {measured}, name claims {dig}")
             sweep_failed += 1
+    for path_, _dig in pairs:
+        try:
+            st = os.stat(path_)
+        except OSError as e:
+            warn(f"audit: stat failed on {path_}: {e}")
+            continue
+        if st.st_uid != 0 or (st.st_mode & 0o777) != 0o444:
+            warn(
+                f"audit: {path_} is not 0444 root:root "
+                f"(uid={st.st_uid} mode={oct(st.st_mode & 0o777)}) — "
+                "seal normalizes it on its next pass"
+            )
     if not args.only:
         orphan_paths = [path_ for path_, dig in pairs if dig not in pinned]
         if orphan_paths:

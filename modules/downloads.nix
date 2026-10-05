@@ -14,11 +14,13 @@
 #     dataDir/store (0444 root:root), writes the provenance sidecar and
 #     README, creates the absolute symlinks -- link parent dirs land
 #     0775 user:group so foreign writers keep arranging them; blobs stay
-#     root:root 0444. No network I/O.
+#     root:root 0444. Every pass also re-asserts mode/ownership across
+#     the whole store (several pre-normalization blobs may still be
+#     service-user-owned). No network I/O.
 #   <target>-pin-audit (service user, timer cfg.auditSchedule)
 #     the ensure pass plus a full sweep of the store: every blob
-#     re-measured against its embedded digest; orphans and unrecognized
-#     files listed (never deleted).
+#     re-measured against its embedded digest; orphans, mode/ownership
+#     violations and unrecognized files listed (never deleted).
 #
 # Store law (the tools/download_runtime.py docstring is the full contract):
 #   blob    = dataDir/store/<stem>--<full-sha256><ext>
@@ -42,6 +44,12 @@
 # extracted, and discarded), the namespace's directories re-seal 0555 on
 # every pass, and content no longer claimed by a pin is removed. Full
 # contract: tools/download_runtime.py docstring.
+#
+# Reporting companion: destination composition and the resolved manifest
+# derivation are hoisted to module scope so the read-only reporting
+# module (modules/reporting.nix, around tools/report_runtime.py) can
+# consume the same manifest (exposed at the internal option
+# cfg.comfyui.pinManifestFile) instead of duplicating this logic.
 {
   config,
   pkgs,
@@ -55,12 +63,111 @@ let
     flakeIgnore = [ "E501" ];
   } (builtins.readFile ./../tools/download_runtime.py);
 
+  # Destination resolution + manifest derivation, hoisted. Single-instance
+  # assumption: one comfyui install (one manifest, one reporting tool) per
+  # host, matching the reporting module.
+  target = "comfyui";
+  wfpinsRoot = "${cfg.workflowsDir}/nix-managed/pins";
+  storeBin = "${runtime}/bin/download-runtime";
+
+  # Destination resolution — same contract as before: explicit dest,
+  # or models/<type>/<arch segments>/<name> for structured pins. type
+  # = "workflows" composes a folder under the nix-managed/pins
+  # read-only namespace instead. The manifest carries the composed
+  # dataDir-relative dest; the runtime does the rest.
+  segOk =
+    s: s != "" && s != "." && !lib.hasInfix "/" s && !lib.hasInfix ".." s;
+
+  isWorkflows = dl: dl.type != null && dl.type == "workflows";
+
+  wfFolderOf =
+    key: dl:
+    let
+      tail = lib.filter (s: s != "") (
+        lib.splitString "/" (if dl.dest != null then dl.dest else key)
+      );
+    in
+    if dl.unzipInto != null then
+      throw "downloads[\"${key}\"]: unzipInto is retired — type = \"workflows\" extracts any zip at the dest automatically"
+    else if dl.arch != [ ] then
+      throw "downloads[\"${key}\"]: arch has no meaning for type = \"workflows\""
+    else if dl.name != null && !segOk dl.name then
+      throw "downloads[\"${key}\"]: name must be a single path segment"
+    else if tail == [ ] then
+      throw "downloads[\"${key}\"]: workflow entries need a dest folder tail (or a usable key)"
+    else if !lib.all segOk tail then
+      throw "downloads[\"${key}\"]: dest folder needs plain single segments (${lib.concatStringsSep "/" tail})"
+    else if lib.elem "nix-managed" tail then
+      throw "downloads[\"${key}\"]: the segment \"nix-managed\" is reserved for the read-only namespace"
+    else lib.concatStringsSep "/" tail;
+
+  destOf =
+    key: dl:
+    if isWorkflows dl then
+      "${wfpinsRoot}/${wfFolderOf key dl}"
+    else if dl.dest != null then
+      dl.dest
+    else if dl.type != null then
+      if dl.name == null then
+        throw "downloads[\"${key}\"]: structured entry (type set) needs a name"
+      else if !lib.all segOk ([ dl.type ] ++ dl.arch ++ [ dl.name ]) then
+        throw "downloads[\"${key}\"]: type/arch/name must be single path segments"
+      else lib.concatStringsSep "/" ([ "models" dl.type ] ++ dl.arch ++ [ dl.name ])
+    else throw "downloads[\"${key}\"]\"]: id-keyed entries need a type+name or a dest";
+
+  entryOf =
+    key: dl:
+    let
+      primaryUrls =
+        (lib.optional (dl.source == "civitai" && dl.versionId != null)
+          "https://civitai.com/api/download/models/${dl.versionId}")
+        ++ (lib.optional
+          (dl.source == "huggingface" && dl.repo != null && dl.rev != null)
+          "https://huggingface.co/${dl.repo}/resolve/${dl.rev}/${
+            lib.optionalString (dl.file != null) dl.file
+          }")
+        ++ (lib.optional (dl.url != null) dl.url);
+      urls = lib.unique (lib.filter (u: u != null && u != "") (
+        primaryUrls ++ dl.fallbackUrls
+      ));
+    in
+    {
+      id = key;
+      kind = if isWorkflows dl then "workflow" else null;
+      dest = destOf key dl;
+      sha256 = if dl.sha256 != null then dl.sha256 else "";
+      tokenFile = dl.tokenFile or null;
+      unzipInto = dl.unzipInto or null;
+      name = if isWorkflows dl then dl.name else null;
+      inherit (dl) fallbackUrls;
+      urls = urls;
+      legacy =
+        if isWorkflows dl then false
+        else (dl.unzipInto or null) != null
+          || !(lib.hasPrefix "models/" (destOf key dl));
+      provenance = lib.filterAttrs (n: v: v != null) {
+        source = dl.source;
+        inherit (dl) versionId repo rev file;
+        url = dl.url;
+      };
+    };
+
+  entries = lib.mapAttrsToList entryOf cfg.downloads;
+
+  badSha = lib.filter (e: !(lib.stringLength e.sha256 == 64)) entries;
+  destsList = map (e: e.dest) entries;
+  dupDests = lib.filter (d: lib.length (lib.filter (x: x == d) destsList) > 1) (
+    lib.unique destsList
+  );
+
+  pinManifest = pkgs.writeText "${target}-pins.json" (builtins.toJSON entries);
+
   mkPinStoreUnits =
     {
       dataDir,
       user,
       group ? "comfyui",
-      downloads,
+      pinManifest,
       wfpinsRoot,
       enforce ? true,
       auditSchedule ? null,
@@ -68,99 +175,6 @@ let
       target ? "comfyui",
     }:
     let
-      # Destination resolution — same contract as before: explicit dest,
-      # or models/<type>/<arch segments>/<name> for structured pins. type
-      # = "workflows" composes a folder under the nix-managed/pins
-      # read-only namespace instead. The manifest carries the composed
-      # dataDir-relative dest; the runtime does the rest.
-      segOk =
-        s: s != "" && s != "." && !lib.hasInfix "/" s && !lib.hasInfix ".." s;
-
-      isWorkflows = dl: dl.type != null && dl.type == "workflows";
-
-      wfFolderOf =
-        key: dl:
-        let
-          tail = lib.filter (s: s != "") (
-            lib.splitString "/" (if dl.dest != null then dl.dest else key)
-          );
-        in
-        if dl.unzipInto != null then
-          throw "downloads[\"${key}\"]: unzipInto is retired — type = \"workflows\" extracts any zip at the dest automatically"
-        else if dl.arch != [ ] then
-          throw "downloads[\"${key}\"]: arch has no meaning for type = \"workflows\""
-        else if dl.name != null && !segOk dl.name then
-          throw "downloads[\"${key}\"]: name must be a single path segment"
-        else if tail == [ ] then
-          throw "downloads[\"${key}\"]: workflow entries need a dest folder tail (or a usable key)"
-        else if !lib.all segOk tail then
-          throw "downloads[\"${key}\"]: dest folder needs plain single segments (${lib.concatStringsSep "/" tail})"
-        else if lib.elem "nix-managed" tail then
-          throw "downloads[\"${key}\"]: the segment \"nix-managed\" is reserved for the read-only namespace"
-        else lib.concatStringsSep "/" tail;
-
-      destOf =
-        key: dl:
-        if isWorkflows dl then
-          "${wfpinsRoot}/${wfFolderOf key dl}"
-        else if dl.dest != null then
-          dl.dest
-        else if dl.type != null then
-          if dl.name == null then
-            throw "downloads[\"${key}\"]: structured entry (type set) needs a name"
-          else if !lib.all segOk ([ dl.type ] ++ dl.arch ++ [ dl.name ]) then
-            throw "downloads[\"${key}\"]: type/arch/name must be single path segments"
-          else lib.concatStringsSep "/" ([ "models" dl.type ] ++ dl.arch ++ [ dl.name ])
-        else throw "downloads[\"${key}\"]\"]: id-keyed entries need a type+name or a dest";
-
-      entryOf =
-        key: dl:
-        let
-          primaryUrls =
-            (lib.optional (dl.source == "civitai" && dl.versionId != null)
-              "https://civitai.com/api/download/models/${dl.versionId}")
-            ++ (lib.optional
-              (dl.source == "huggingface" && dl.repo != null && dl.rev != null)
-              "https://huggingface.co/${dl.repo}/resolve/${dl.rev}/${
-                lib.optionalString (dl.file != null) dl.file
-              }")
-            ++ (lib.optional (dl.url != null) dl.url);
-          urls = lib.unique (lib.filter (u: u != null && u != "") (
-            primaryUrls ++ dl.fallbackUrls
-          ));
-        in
-        {
-          id = key;
-          kind = if isWorkflows dl then "workflow" else null;
-          dest = destOf key dl;
-          sha256 = if dl.sha256 != null then dl.sha256 else "";
-          tokenFile = dl.tokenFile or null;
-          unzipInto = dl.unzipInto or null;
-          name = if isWorkflows dl then dl.name else null;
-          inherit (dl) fallbackUrls;
-          urls = urls;
-          legacy =
-            if isWorkflows dl then false
-            else (dl.unzipInto or null) != null
-              || !(lib.hasPrefix "models/" (destOf key dl));
-          provenance = lib.filterAttrs (n: v: v != null) {
-            source = dl.source;
-            inherit (dl) versionId repo rev file;
-            url = dl.url;
-          };
-        };
-
-      entries = lib.mapAttrsToList entryOf downloads;
-
-      badSha = lib.filter (e: !(lib.stringLength e.sha256 == 64)) entries;
-      destsList = map (e: e.dest) entries;
-      dupDests = lib.filter (d: lib.length (lib.filter (x: x == d) destsList) > 1) (
-        lib.unique destsList
-      );
-
-      pinManifest = pkgs.writeText "${target}-pins.json" (builtins.toJSON entries);
-
-      storeBin = "${runtime}/bin/download-runtime";
       # The runtime shells out to curl, openssl and coreutils (sha256sum).
       # The units get them through the systemd `path` option — a unit PATH
       # composed of pinned nix store dirs, never the ambient host env.
@@ -249,12 +263,18 @@ let
     };
 in
 {
-  # Instantiated unconditionally: with an empty list the units are no-ops.
-  config = mkPinStoreUnits {
-    inherit (cfg) dataDir user group downloads;
-    wfpinsRoot = "${cfg.workflowsDir}/nix-managed/pins";
-    enforce = cfg.enforcePaths;
-    auditSchedule = cfg.auditSchedule;
-    mountUnits = cfg.requiresMounts;
-  };
+  config = lib.mkMerge [
+    # The resolved manifest path is the reporting module's data source
+    # (internal option, declared in modules/options.nix).
+    { cfg.comfyui.pinManifestFile = "${pinManifest}"; }
+    # Instantiated unconditionally: with an empty list the units are no-ops.
+    (mkPinStoreUnits {
+      inherit (cfg) dataDir user group;
+      inherit pinManifest;
+      inherit wfpinsRoot;
+      enforce = cfg.enforcePaths;
+      auditSchedule = cfg.auditSchedule;
+      mountUnits = cfg.requiresMounts;
+    })
+  ];
 }

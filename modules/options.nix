@@ -384,5 +384,17 @@ with lib;
         Example: "weekly" or "Sun *-01..07 05:00".
       '';
     };
+
+    pinManifestFile = mkOption {
+      type = with types; nullOr str;
+      default = null;
+      internal = true;
+      visible = false;
+      description = ''
+        Internal: the resolved pin manifest (nix store path of
+        <target>-pins.json), set by modules/downloads.nix and consumed by
+        the read-only reporting module (modules/reporting.nix).
+      '';
+    };
   };
 }
