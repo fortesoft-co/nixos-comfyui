@@ -50,10 +50,13 @@ the model's version list while the page still resolves), not_found, error.
 The update candidate is the newest versionId among published versions
 sharing the pinned version's baseModel (Lora-Manager-style family
 matching: H/L, T2V/I2V or per-character pages on one model stay
-"current" instead of recommending a sibling's bytes). When that
-candidate is itself pinned elsewhere in the store the pin reads
-up-to-date with a note naming the sibling pin. Newer versions on other
-base models surface as notes, never verdict changes.
+"current" instead of recommending a sibling's bytes). Versions that
+ship no loadable weight file — civitai hosts diffusers-format exports
+and training data as .zip entries — are skipped as candidates and
+noted: packaging, not an update. When the candidate is itself pinned
+elsewhere in the store the pin reads up-to-date with a note naming the
+sibling pin. Newer versions on other base models surface as notes,
+never verdict changes.
 --model-wide-latest restores whole-model latest comparison.
 API traffic is paced (--delay, default 2.0 s between requests; Retry-After
 honored; 429/5xx backed off exponentially) with one mirror fallback on
@@ -78,13 +81,18 @@ skip the version-id resolution hop entirely. Outputs land as files next
 to where the tool runs: comfyui-updates.md
 plus one paste-ready comfyui-updates-<category>.nix per non-empty
 category — entries grouped exactly like Lora Manager's loras /
-checkpoints / embeddings buckets, everything else under "other". The
-default is the SAFE path: only clean updates go into the category
-modules; anything carrying a verification tell (a candidate shared by
-several store pins, or your file being a non-primary member of the
-civitai version) is routed to comfyui-updates-verify-first.nix for
-inspection instead. .lastrun.json short-circuits same-day reruns (no
-rechecking of pins already checked today); --fresh forces a full check.
+checkpoints / diffusion_models / embeddings buckets, everything else
+under "other". Update entries follow the candidate's upstream filename
+(--no-follow-upstream-names keeps the old dest name); a rename is
+marked as a comment in the module, and the old semantic path becomes
+an update-orphan the audit reports. The default is the SAFE path: only
+clean updates go into the category modules; anything carrying a
+verification tell (a candidate shared by several store pins, or your
+file being a non-primary member of the civitai version) is routed to
+comfyui-updates-verify-first.nix for inspection instead.
+.lastrun.json short-circuits same-day reruns (no rechecking of pins
+already checked today; invalidated by a manifest or tool-version
+change); --fresh forces a full check.
 """
 
 import argparse
@@ -101,7 +109,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "report_runtime 1.0"
+VERSION = "report_runtime 1.2"
 
 # Substituted at build time by modules/reporting.nix; both accept
 # explicit --manifest / --dataDir overrides.
@@ -1008,6 +1016,32 @@ def _primary_file(version_row):
     return files[0] if files else None
 
 
+LOADABLE_EXTS = (".safetensors", ".pt", ".pth", ".ckpt", ".gguf", ".sft")
+
+
+def _file_loadable(f):
+    return os.path.splitext(str((f or {}).get("name") or "").lower())[1] in LOADABLE_EXTS
+
+
+def _loadable_file(files):
+    """The version's loadable weight file — primary first, else the first
+    file a ComfyUI loader could open — or None. Civitai packages
+    diffusers-format exports and training data as .zip entries that still
+    carry weight file types; those are containers, not single-file
+    weights, so a version without a loadable file must not rate as an
+    update candidate."""
+    prim = None
+    for f in (files or []):
+        if prim is None:
+            prim = f
+        if f.get("primary") and _file_loadable(f):
+            return f
+    for f in (files or []):
+        if _file_loadable(f):
+            return f
+    return None
+
+
 def _file_sha(file_row):
     hashes = (file_row or {}).get("hashes") or {}
     sha = str(hashes.get("SHA256") or "").strip().lower()
@@ -1112,7 +1146,7 @@ def _snippet(pin, cand, verified, keep_name):
         if keep_name:
             local_name = parts[-1]
         else:
-            local_name = cand.get("fileName") or parts[-1]
+            local_name = os.path.basename(str(cand.get("fileName") or "")) or parts[-1]
         lines.append(f"        name = \"{_nix_escape(local_name)}\";")
     else:
         lines.append(f"        dest = \"{_nix_escape(dest)}\";")
@@ -1299,22 +1333,43 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
     # model-wide (publishedAt, id) latest. VersionId order is deliberate:
     # ids follow upload order, and publish dates invert on H/L re-uploads.
     pinned_base = str(pinned_row.get("baseModel") or "").strip().lower()
+    pinned_type = str(pinned_row.get("baseModelType") or "").strip().lower() or None
     use_base = bool(pinned_base) and not getattr(args, "model_wide_latest", False)
     other_base = []
     latest = None
+    packaging_skip = None
     if use_base:
         pinned_int = _parse_int(vid) or 0
         for v in published:
             v_int = _parse_int(v.get("id")) or 0
-            if str(v.get("baseModel") or "").strip().lower() == pinned_base:
+            v_type = str(v.get("baseModelType") or "").strip().lower() or None
+            if str(v.get("baseModel") or "").strip().lower() == pinned_base and (pinned_type is None or v_type is None or v_type == pinned_type):
+                if _loadable_file(v.get("files")) is None:
+                    # packaging-only (diffusers/training zip): never a
+                    # candidate; noted below when newer than the pin
+                    if packaging_skip is None or v_int > packaging_skip[0]:
+                        packaging_skip = (v_int, v)
+                    continue
                 if latest is None or v_int > (_parse_int(latest.get("id")) or 0):
                     latest = v
             elif v_int > pinned_int:
-                other_base.append((v_int, v.get("baseModel")))
+                v_base = str(v.get("baseModel") or "?")
+                if v_base.strip().lower() == pinned_base:
+                    v_base = v_base + " / " + str(v.get("baseModelType") or "?")
+                other_base.append((v_int, v_base))
         other_base.sort(key=lambda pair: -pair[0])
     else:
         latest_key = None
         for v in published:
+            if pinned_type is not None:
+                v_type = str(v.get("baseModelType") or "").strip().lower() or None
+                if v_type is not None and v_type != pinned_type:
+                    continue
+            if _loadable_file(v.get("files")) is None:
+                v_int = _parse_int(v.get("id")) or 0
+                if packaging_skip is None or v_int > packaging_skip[0]:
+                    packaging_skip = (v_int, v)
+                continue
             key = (str(v.get("publishedAt") or ""), _parse_int(v.get("id")) or 0)
             if latest is None or key > latest_key:
                 latest = v
@@ -1341,6 +1396,13 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
         extra = " (+{} more)".format(len(other_base) - 3) if len(other_base) > 3 else ""
         trailing = "newer versions on other base models: {}{}".format(
             ", ".join(shown), extra)
+    skip_note = None
+    if packaging_skip is not None and packaging_skip[0] > (_parse_int(vid) or 0):
+        pk_name = (packaging_skip[1].get("name") or "?")
+        pk_file = str((_primary_file(packaging_skip[1]) or {}).get("name") or "?")
+        skip_note = ("newer version v{} '{}' ships no loadable weight file "
+                     "(packaging-only: {}) — skipped as candidate".format(
+                         packaging_skip[0], pk_name, pk_file))
     # Our bytes' member on each version: the pin's own provenance file
     # (civitai), the by-hash matched file (hf), else the primary. Update
     # candidates target the SAME-NAMED member of the candidate version —
@@ -1356,7 +1418,7 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
     cand_file = _member_named(cand_row, pin_member_name)
     cand_member = cand_file is not None
     if not cand_member:
-        cand_file = _primary_file(cand_row)
+        cand_file = _loadable_file(cand_row.get("files")) or _primary_file(cand_row)
     hf_note = None
     if hf_matched_name and hf_matched_name != (pinned_file or {}).get("name"):
         if cand_member:
@@ -1382,18 +1444,21 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
         "downloadUrl": (cand_file or {}).get("downloadUrl"),
         "changelog": str(cand_row.get("changelog") or ""),
     }
-    notes = [n for n in (note_txt, trailing, hf_note) if n]
+    notes = [n for n in (skip_note, note_txt, trailing, hf_note) if n]
+    dest_base = os.path.basename(str(result["dest"] or ""))
+    cand_base = os.path.basename(str((cand_file or {}).get("name") or ""))
+    if verdict in ("update", "drift") and cand_base and cand_base != dest_base:
+        old_ext = os.path.splitext(dest_base.lower())[1]
+        new_ext = os.path.splitext(cand_base.lower())[1]
+        ext_part = "name-only rename"
+        if old_ext != new_ext:
+            ext_part = "ext changes: " + old_ext + " → " + new_ext
+        result["rename"] = {"from": dest_base, "to": cand_base,
+                            "ext_changed": old_ext != new_ext}
+        notes.append("update renames the artifact: {} → {} ({})".format(
+            dest_base, cand_base, ext_part))
     if notes:
         result["note"] = "; ".join(notes)
-    if cand_member is False and verdict == "update" and (cand.get("fileName") or ""):
-        cand_ext = os.path.splitext(str(cand["fileName"]).lower())[1]
-        dest_ext = os.path.splitext(os.path.basename(str(result["dest"] or "")).lower())[1]
-        if cand_ext and dest_ext and cand_ext != dest_ext:
-            result["tell"] = "; ".join(x for x in (
-                result.get("tell"),
-                "the candidate's primary is a '{}' while your dest is a '{}' "
-                "— resolve the matching member before pasting".format(
-                    cand_ext, dest_ext)) if x)
     result.update(verdict=verdict, source=source, model=model_row,
                   candidate=cand)
     if verdict in ("update", "drift"):
@@ -1527,7 +1592,8 @@ def _update_md(path, args, pins, results, targets, tallies, reuse=0, live=0):
         c = r.get("category") or "other"
         d = cats.setdefault(c, {})
         d[r["verdict"]] = d.get(r["verdict"], 0) + 1
-    for cat in ("loras", "checkpoints", "embeddings", "other"):
+    for cat in ("loras", "checkpoints", "diffusion_models", "embeddings",
+                "other"):
         if cat in cats:
             d = cats[cat]
             lines.append("- " + cat + ": " + ", ".join(
@@ -1573,11 +1639,12 @@ def _update_md(path, args, pins, results, targets, tallies, reuse=0, live=0):
     progress(args, "md written: " + path)
 
 
-LM_CLASSES = ("loras", "checkpoints", "embeddings")
+LM_CLASSES = ("loras", "checkpoints", "diffusion_models", "embeddings")
 
 
 def _category_of(pin):
-    """LM-style bucket for a pin: loras/checkpoints/embeddings, else other."""
+    """LM-style bucket for a pin: loras/checkpoints/diffusion_models/
+    embeddings, else other."""
     dest = pin.get("dest") or ""
     parts = dest.split("/")
     if len(parts) > 2 and parts[0] == "models" and parts[1] in LM_CLASSES:
@@ -1602,7 +1669,8 @@ def _manifest_digest(path):
 
 
 def _load_lastrun(path, manifest_path, args):
-    """Stored results from a same-day run over the same manifest, else None."""
+    """Stored results from a same-day run over the same manifest and
+    tool version, else None."""
     if getattr(args, "fresh", False):
         return None
     try:
@@ -1616,6 +1684,8 @@ def _load_lastrun(path, manifest_path, args):
     if doc.get("day") != today:
         return None
     if doc.get("manifest_sha") != _manifest_digest(manifest_path):
+        return None
+    if doc.get("version") != VERSION:
         return None
     stored = doc.get("results")
     return stored if isinstance(stored, dict) else None
@@ -1671,6 +1741,12 @@ def _write_nix_module(path, header, rows, with_tells=False):
         if r.get("source") == "huggingface":
             marks.append("was an hfFetch pin — this candidate adopts civitai "
                          "provenance")
+        if r.get("rename"):
+            ren = r["rename"]
+            line = "renames the artifact: " + ren["from"] + " → " + ren["to"]
+            if ren.get("ext_changed"):
+                line = line + " — EXTENSION CHANGES; loaders may need rewiring"
+            marks.append(line)
         if with_tells:
             marks += ["tell: " + t
                       for t in str(r.get("tell") or "").split("; ")]
@@ -1714,13 +1790,18 @@ def _write_updates_files(out_dir, results, args, pins, targets, tallies,
     group_headers = {
         "lm-parity":
             ("# Lora-Manager-parity updates: the loras / checkpoints /\n"
-             "# embeddings entries LM's update view covers. Clean candidates\n"
-             "# only (no verification tells). Paste into the matching\n"
-             "# downloads/<family>.nix files.\n"),
+             "# diffusion_models / embeddings entries LM's update view\n"
+             "# covers. Clean candidates only (no shared-candidate or\n"
+             "# non-primary tells). Renames are marked as comments — when\n"
+             "# the extension changes too, loaders may need rewiring; the\n"
+             "# old semantic path becomes an update-orphan the audit\n"
+             "# reports. Paste into the matching downloads/<family>.nix\n"
+             "# files.\n"),
         "other":
-            ("# Updates on pins OUTSIDE Lora Manager's index: diffusion\n"
-             "# models, text encoders, vaes, upscalers, adapters, tooling.\n"
-             "# Clean candidates only. Safe to paste.\n"),
+            ("# Updates on pins OUTSIDE Lora Manager's index: text\n"
+             "# encoders, vaes, upscalers, adapters, tooling. Clean\n"
+             "# candidates only; renames marked as in the parity module.\n"
+             "# Safe to paste.\n"),
     }
     for gname in ("lm-parity", "other"):
         rows = groups[gname]
@@ -1774,7 +1855,7 @@ def _console_summary(args, results, counts, written, reuse_n, live_n):
         b = buckets.get(gname)
         if not b:
             continue
-        label = ("lm-parity (loras/checkpoints/embeddings)"
+        label = ("lm-parity (loras/checkpoints/diffusion_models/embeddings)"
                  if gname == "lm-parity" else "other (outside lm's index)")
         chunks = []
         for cat, d in sorted(b.items()):
@@ -2049,11 +2130,14 @@ exit status: 0 when nothing needs attention, else 1."""
 
 EPILOG_UPDATES = """verdicts per civitai pin:
   up-to-date   pinned versionId is the newest version on its baseModel
-               (model-wide latest with --model-wide-latest); when the
-               family's newest same-base version is itself pinned here, a
-               note names that sibling pin
+               and baseModelType (model-wide latest with
+               --model-wide-latest); when the family's newest same-base
+               version is itself pinned here, a note names that sibling
+               pin
   update       a newer version on the same baseModel exists; sha256 of
-               its primary file reported
+               its loadable primary file reported — versions whose only
+               files are packaging containers (diffusers/training zips)
+               are skipped as candidates and noted
   drift        same versionId re-uploaded upstream; hash changed
   deleted      pinned version no longer in the model's version list
   not_found    version (or model) answers 403/404 on civitai.com and mirror
@@ -2064,13 +2148,18 @@ by-hash index and run the same logic; hf-sourced candidates are marked
 in every generated module. "not on civitai by hash" notes up-to-date.
 newer versions on other base models are notes, not verdict changes.
 
-newer versions on other base models are notes, not verdict changes.
+update entries follow the candidate's upstream filename by default
+(--no-follow-upstream-names restores the dest-name policy); a rename —
+same or changed extension — is marked in the note and as a comment in
+the generated module, and the old semantic path becomes an
+update-orphan the audit reports.
 
 files: comfyui-updates.md + comfyui-updates-<category>.nix per category
-(categories: loras, checkpoints, embeddings, other) with CLEAN entries
-only, plus comfyui-updates-verify-first.nix for entries carrying a
-shared-candidate / non-primary tell — inspect those, never blind-paste.
-.lastrun.json short-circuits same-day reruns; --fresh rechecks all.
+(categories: loras, checkpoints, diffusion_models, embeddings, other)
+with CLEAN entries only, plus comfyui-updates-verify-first.nix for
+entries carrying a shared-candidate / non-primary tell — inspect those,
+never blind-paste. .lastrun.json short-circuits same-day reruns
+(invalidated by a manifest or tool-version change); --fresh rechecks all.
 
 api calls: paced (--delay) against the civitai API only; `report` and the
 local scans never touch the network. exit status: 0, else 1 on any error."""
@@ -2160,9 +2249,11 @@ def build_argparser():
     updates_p.add_argument("--nix-snippets", action="store_true",
                            help="deprecated alias of --print-snippets")
     updates_p.add_argument(
-        "--follow-upstream-names", action="store_true",
-        help="snippets take the candidate's upstream filename; the default "
-        "keeps the existing local dest name (stable-name policy)")
+        "--follow-upstream-names",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="snippets take the candidate's upstream filename (default on); "
+        "--no-follow-upstream-names keeps the existing local dest name "
+        "(stable-name policy)")
     updates_p.add_argument(
         "--verify", action="store_true",
         help="download + hash each candidate before printing its snippet")
