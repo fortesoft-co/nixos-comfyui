@@ -53,9 +53,16 @@ base models surface as notes, never verdict changes.
 API traffic is paced (--delay, default 2.0 s between requests; Retry-After
 honored; 429/5xx backed off exponentially) with one mirror fallback on
 403/404 for entries civitai.com masks, plus an optional json response
-cache (--cache-ttl, default 24 h). Snippets are printed only from
+cache (--cache-ttl, default 24 h). Requests that carry a token go
+mirror-first (civitai.red serves the identical API) so masked entries
+don't pay a wasted civitai.com round trip. Snippets are printed only from
 API-reported primary-file hashes unless --verify downloads and hashes the
 candidate first; the boot pass sha-gates the real download either way.
+
+--include-hf also checks huggingface pins: the pinned sha256 is resolved
+against civitai's by-hash index and the same same-baseModel logic applies;
+"not on civitai by hash" is reported as an up-to-date note (nothing to
+track) and the update snippet is a full civitaiFetch replacement.
 """
 
 import argparse
@@ -304,6 +311,11 @@ class Civitai:
         mirrored = _mirror_url(url, self.mirror)
         if mirrored:
             candidates.append(mirrored)
+        if token and mirrored:
+            # Tokenized requests go mirror-first: civitai.red serves the
+            # identical API, and masked/nsfw entries otherwise pay a wasted
+            # civitai.com round trip before the fallback fires.
+            candidates.reverse()
         saw_4xx = False
         unreachable = False
         for index, candidate in enumerate(candidates):
@@ -332,7 +344,10 @@ class Civitai:
                         continue
                     saw_4xx = True
                     if index + 1 < len(candidates):
-                        _warn(f"api {e.code} on civitai.com — trying {self.mirror}")
+                        fail_host = urllib.parse.urlsplit(candidate).hostname
+                        next_host = urllib.parse.urlsplit(
+                            candidates[index + 1]).hostname
+                        _warn(f"api {e.code} on {fail_host} — trying {next_host}")
                     break
                 except (Transient, OSError) as e:
                     if attempts >= 3:
@@ -1027,7 +1042,7 @@ def _verify_candidate(cand, token, args):
     return measured, None
 
 
-def _snippet(pin, cand, verified, keep_name):
+def _snippet(pin, cand, verified, keep_name, file=None):
     pin_id = _nix_escape(pin["id"])
     dest = pin.get("dest") or ""
     sha = str(cand.get("sha") or "")
@@ -1051,8 +1066,9 @@ def _snippet(pin, cand, verified, keep_name):
         lines.append(f"        versionId = {cand['versionId']};")
     lines.append(f'        sha256 = "{sha}";')
     prov = pin.get("provenance") or {}
-    if prov.get("file"):
-        lines.append(f"        file = \"{_nix_escape(prov['file'])}\";")
+    file_name = prov.get("file") or file
+    if file_name:
+        lines.append(f"        file = \"{_nix_escape(file_name)}\";")
     if dest.startswith("models/"):
         parts = dest[len("models/"):].split("/")
         lines.append(f"        type = \"{_nix_escape(parts[0])}\";")
@@ -1073,16 +1089,14 @@ def _snippet(pin, cand, verified, keep_name):
     return "\n".join(lines)
 
 
-def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
-    """Check one civitai pin; sibling_pins maps versionId -> pin ids."""
-    sibling_pins = sibling_pins or {}
-    prov = pin.get("provenance") or {}
-    vid = str(prov.get("versionId") or "")
+def _blank_result(pin, store):
+    """Result skeleton shared by the civitai and hf checkers."""
     pin_sha = (pin.get("sha256") or "").strip().lower()
-    result = {
+    return {
         "pin": pin["id"],
         "dest": pin.get("dest") or "",
         "verdict": "error",
+        "source": None,
         "in_store": bool(store["by_digest"].get(pin_sha)) if pin_sha else False,
         "local_sha": pin_sha or None,
         "pinned": None,
@@ -1091,6 +1105,14 @@ def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
         "note": None,
         "snippet": None,
     }
+
+
+def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
+    """Check one civitai pin; sibling_pins maps versionId -> pin ids."""
+    sibling_pins = sibling_pins or {}
+    vid = str((pin.get("provenance") or {}).get("versionId") or "")
+    result = _blank_result(pin, store)
+    result["source"] = "civitai"
     try:
         vdoc = api.get(CIVITAI_BASE + "/api/v1/model-versions/" + vid, token)
     except NotFound as e:
@@ -1106,6 +1128,60 @@ def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
                     note=f"model {mid} is gone while its version endpoint works")
     except ApiError as e:
         return dict(result, note=str(e))
+    return _assess_version(result, pin, vid, vdoc, mdoc, token, args,
+                           sibling_pins, "civitai")
+
+
+def _check_hf_pin(api, pin, token, store, args, sibling_pins=None):
+    """Check a huggingface pin: identity from civitai's by-hash index,
+    then the same family logic as civitai pins. No sha256 -> HEAD probe."""
+    sibling_pins = sibling_pins or {}
+    result = _blank_result(pin, store)
+    result["source"] = "huggingface"
+    sha = (pin.get("sha256") or "").strip().lower()
+    if not sha:
+        urls = pin.get("urls") or []
+        url = urls[0] if urls else None
+        if not url:
+            return dict(result, verdict="not_found",
+                        note="no sha256 and no resolve url to probe")
+        code = api.head(url, token)
+        if code in (200, 301, 302, 303, 307, 308):
+            return dict(result, verdict="up-to-date",
+                        note="no sha256; upstream HEAD alive")
+        if code in (404, 410):
+            return dict(result, verdict="not_found",
+                        note=f"upstream gone — resolve url answers {code}")
+        return dict(result, note=f"HEAD answered {code}")
+    try:
+        vdoc = api.get(CIVITAI_BASE + "/api/v1/model-versions/by-hash/" + sha,
+                       token)
+    except NotFound:
+        return dict(result, verdict="up-to-date",
+                    note="not on civitai by hash — no mirror to track; "
+                         "the hf rev governs")
+    except ApiError as e:
+        return dict(result, note=str(e))
+    mid = vdoc.get("modelId")
+    if mid is None:
+        return dict(result, note="by-hash matched but the version exposes no modelId")
+    try:
+        mdoc = api.get(CIVITAI_BASE + "/api/v1/models/" + str(mid), token)
+    except NotFound:
+        return dict(result, verdict="not_found",
+                    note=f"civitai model {mid} is gone")
+    except ApiError as e:
+        return dict(result, note=str(e))
+    return _assess_version(result, pin, str(vdoc.get("id") or ""), vdoc, mdoc,
+                           token, args, sibling_pins, "huggingface")
+
+
+def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
+                    source):
+    """Family logic shared by civitai pins and hf (by-hash) identities."""
+    sibling_pins = sibling_pins or {}
+    pin_sha = result.get("local_sha") or ""
+    mid = vdoc.get("modelId")
     model_row = {
         "id": mid,
         "name": mdoc.get("name"),
@@ -1119,17 +1195,28 @@ def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
             pinned_row = v
             break
     if pinned_row is None:
+        if source != "civitai":
+            return dict(result, verdict="up-to-date", model=model_row,
+                        note=("civitai version {} is no longer in the model's "
+                              "version list (removed/unpublished); the "
+                              "matched hash still identifies it".format(vid)))
         return dict(result, verdict="deleted", model=model_row,
                     note=(f"version {vid} no longer in the model's version "
                           f"list; the store blob is the local copy"))
     pinned_file = _primary_file(pinned_row)
+    hf_matched_name = None
+    if source != "civitai":
+        for f in (pinned_row.get("files") or []):
+            if (_file_sha(f) or "").lower() == pin_sha:
+                hf_matched_name = (f or {}).get("name")
+                break
     result["pinned"] = {
         "versionId": vid,
         "baseModel": pinned_row.get("baseModel") or None,
         "date": str(pinned_row.get("publishedAt") or "")[:10],
         "sha": _file_sha(pinned_file),
         "bytes": _file_bytes(pinned_file),
-        "fileName": (pinned_file or {}).get("name"),
+        "fileName": hf_matched_name or (pinned_file or {}).get("name"),
     }
     # Candidate selection: newest versionId on the pinned version's own
     # baseModel when known (Lora-Manager-style family matching), else the
@@ -1178,11 +1265,18 @@ def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
         extra = " (+{} more)".format(len(other_base) - 3) if len(other_base) > 3 else ""
         trailing = "newer versions on other base models: {}{}".format(
             ", ".join(shown), extra)
-    notes = [n for n in (note_txt, trailing) if n]
+    hf_note = None
+    if hf_matched_name and hf_matched_name != (pinned_file or {}).get("name"):
+        hf_note = ("your file is '{}' on this civitai version (primary: "
+                   "'{}')".format(hf_matched_name,
+                                  (pinned_file or {}).get("name")))
+    notes = [n for n in (note_txt, trailing, hf_note) if n]
     if notes:
         result["note"] = "; ".join(notes)
     cand_sha = _file_sha(_primary_file(cand_row))
-    if verdict == "up-to-date" and cand_sha and pin_sha and cand_sha != pin_sha:
+    same_verdict = verdict == "up-to-date"
+    sha_differs = bool(cand_sha) and bool(pin_sha) and cand_sha != pin_sha
+    if same_verdict and source == "civitai" and sha_differs:
         verdict = "drift"
     cand_file = _primary_file(cand_row)
     cand = {
@@ -1195,7 +1289,8 @@ def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
         "downloadUrl": (cand_file or {}).get("downloadUrl"),
         "changelog": str(cand_row.get("changelog") or ""),
     }
-    result.update(verdict=verdict, model=model_row, candidate=cand)
+    result.update(verdict=verdict, source=source, model=model_row,
+                  candidate=cand)
     if verdict in ("update", "drift"):
         if not cand.get("sha"):
             prior = result.get("note")
@@ -1214,9 +1309,15 @@ def _check_civitai_pin(api, pin, token, store, args, sibling_pins=None):
                     f"api claims {cand['sha']}"))
             cand["measured"] = measured
             result["candidate"] = cand
+        prov = pin.get("provenance") or {}
+        cand_files = [f for f in (cand_row.get("files") or [])
+                      if f.get("type") == "Model"]
+        file_param = prov.get("file")
+        if verdict != "drift" and (len(cand_files) != 1 or source != "civitai"):
+            file_param = hf_matched_name or cand.get("fileName") or file_param
         result["snippet"] = _snippet(
             pin, cand, verified=bool(cand.get("measured")),
-            keep_name=not args.follow_upstream_names)
+            keep_name=not args.follow_upstream_names, file=file_param)
     return result
 
 
@@ -1311,9 +1412,11 @@ def _update_md(path, args, pins, results, targets, tallies):
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
     lines = ["# CivitAI update report", ""]
     lines.append(f"- manifest: `{pins.manifest_path}`")
+    civ_n = sum(1 for r in results if r.get("source") == "civitai")
+    hf_n = sum(1 for r in results if r.get("source") == "huggingface")
     lines.append(
-        f"- scope: {len(targets)} civitai pins ({tallies['hf']} hf, "
-        f"{tallies['other']} other skipped; {len(pins.workflows)} workflow pins "
+        f"- scope: {civ_n} civitai pins checked, {hf_n} hf pins checked "
+        f"({tallies['other']} other; {len(pins.workflows)} workflow pins "
         f"and {len(pins.legacy)} legacy pins unmanaged here)"
     )
     lines.append(f"- delay: {args.delay}s — generated: {_iso_now()}")
@@ -1398,8 +1501,50 @@ def cmd_updates(args):
         note_part = f" — {r.get('note')}" if r.get("note") else ""
         progress(args, f"{r['verdict']:10} {r['pin']}{note_part}")
     if args.include_hf:
-        _hf_advisory(api, pins, args, token_cache,
-                     emit=progress if _verifying(args) else note)
+        hf_n = 0
+        for p in pins.models:
+            prov = p.get("provenance") or {}
+            if prov.get("source") != "huggingface":
+                continue
+            if args.only and args.only.lower() not in str(p.get("id", "")).lower():
+                continue
+            hf_n += 1
+            token = _token_arg(p, args, token_cache)
+            try:
+                results.append(_check_hf_pin(api, p, token, store, args,
+                                             pinned_by_vid))
+            except Exception as e:
+                results.append({
+                    "pin": p["id"],
+                    "dest": p.get("dest") or "",
+                    "verdict": "error",
+                    "source": "huggingface",
+                    "in_store": False,
+                    "local_sha": None,
+                    "pinned": None,
+                    "candidate": None,
+                    "model": None,
+                    "note": "unexpected: " + repr(e),
+                    "snippet": None,
+                })
+            r = results[-1]
+            note_part = f" — {r.get('note')}" if r.get("note") else ""
+            progress(args, f"{r['verdict']:10} {r['pin']}{note_part}")
+        if hf_n:
+            progress(args, f"hf: {hf_n} pins, identity via civitai by-hash")
+    shared_cand = {}
+    for r in results:
+        if r.get("verdict") == "update" and (r.get("model") or {}).get("id"):
+            shared_cand.setdefault(
+                ((r.get("model") or {}).get("id"),
+                 str((r.get("candidate") or {}).get("versionId"))), []).append(r)
+    for rows in shared_cand.values():
+        if len(rows) > 1:
+            for r in rows:
+                extra = ("same candidate shared by {} store pins — verify "
+                         "the variant before applying".format(len(rows)))
+                r["note"] = (r.get("note") + "; " + extra
+                             if r.get("note") else extra)
     api.flush()
     if args.json:
         counts = {}
@@ -1437,31 +1582,6 @@ def _updates_rc(results):
         if r["verdict"] == "error":
             return 1
     return 0
-
-
-def _hf_advisory(api, pins, args, token_cache, emit=note):
-    emit("")
-    emit("hf advisory (HEAD probe, no download):")
-    cache = {}
-    for p in pins.models:
-        prov = p.get("provenance") or {}
-        if prov.get("source") != "huggingface":
-            continue
-        if args.only and args.only.lower() not in str(p.get("id", "")).lower():
-            continue
-        urls = p.get("urls") or []
-        url = urls[0] if urls else None
-        if not url:
-            emit(f"hf-unknown {p['id']}: no resolve url")
-            continue
-        token = _read_token(p.get("tokenFile") or args.token_file, cache)
-        code = api.head(url, token)
-        if code in (200, 301, 302, 303, 307, 308):
-            emit(f"hf-alive  {p['id']}")
-        elif code in (404, 410):
-            emit(f"hf-gone   {p['id']} — resolve url answers {code}")
-        else:
-            emit(f"hf-error  {p['id']} — HEAD {code if code else 'failed'}")
 
 
 class _HelpFmt(argparse.ArgumentDefaultsHelpFormatter,
@@ -1512,6 +1632,10 @@ EPILOG_UPDATES = """verdicts per civitai pin:
   deleted      pinned version no longer in the model's version list
   not_found    version (or model) answers 403/404 on civitai.com and mirror
   error        transport failure after retries
+
+--include-hf: huggingface pins resolve identity via civitai by-hash and
+run the same logic; "not on civitai by hash" notes an up-to-date verdict.
+newer versions on other base models are notes, not verdict changes.
 
 newer versions on other base models are notes, not verdict changes.
 api calls: paced (--delay) against the civitai API only; `report` and the
@@ -1567,7 +1691,8 @@ def build_argparser():
     updates_p.add_argument("--delay", type=float, default=2.0,
                            help="seconds between api requests")
     updates_p.add_argument("--mirror", default=MIRROR_DEFAULT,
-                           help="mirror host used on 403/404; '' disables")
+                           help="mirror host used on 403/404 — tried first "
+                           "when a token rides the request; '' disables")
     updates_p.add_argument("--no-cache", action="store_true",
                            help="bypass the api response cache entirely")
     updates_p.add_argument("--cache", default=None, metavar="PATH",
@@ -1582,7 +1707,9 @@ def build_argparser():
         "versions as updates)")
     updates_p.add_argument(
         "--include-hf", action="store_true",
-        help="also probe huggingface resolve urls (HEAD, advisory only)")
+        help="also check huggingface pins: identity via civitai by-hash "
+        "(the pinned sha256), same update logic; without a pin sha256, "
+        "HEAD probe of the resolve url (advisory)")
     updates_p.add_argument("--nix-snippets", action="store_true",
                            help="print paste-ready download entries for "
                            "update/drift pins")
