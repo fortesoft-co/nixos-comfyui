@@ -1075,7 +1075,7 @@ def _verify_candidate(cand, token, args):
     return measured, None
 
 
-def _snippet(pin, cand, verified, keep_name, file=None):
+def _snippet(pin, cand, verified, keep_name):
     pin_id = _nix_escape(pin["id"])
     dest = pin.get("dest") or ""
     sha = str(cand.get("sha") or "")
@@ -1087,7 +1087,7 @@ def _snippet(pin, cand, verified, keep_name, file=None):
                     if cand.get("versionId") else "(unknown)")
     verified_part = "  [verified]" if verified else ""
     header = (
-        f"# {pin['id']}: {version_part}"
+        f"      # {pin['id']}: {version_part}"
         f" ({cand.get('date') or 'no date'})"
         f"  {_human_bytes(cand.get('bytes'))}"
         f"{verified_part}"
@@ -1097,11 +1097,11 @@ def _snippet(pin, cand, verified, keep_name, file=None):
     lines.append(f'      "{pin_id}" = civitaiFetch {{')
     if cand.get("versionId"):
         lines.append(f"        versionId = {cand['versionId']};")
+    if cand.get("fileId"):
+        lines.append("        fileId = %d;" % int(cand["fileId"]))
+    if cand.get("modelId"):
+        lines.append("        modelId = %d;" % int(cand["modelId"]))
     lines.append(f'        sha256 = "{sha}";')
-    prov = pin.get("provenance") or {}
-    file_name = prov.get("file") or file
-    if file_name:
-        lines.append(f"        file = \"{_nix_escape(file_name)}\";")
     if dest.startswith("models/"):
         parts = dest[len("models/"):].split("/")
         lines.append(f"        type = \"{_nix_escape(parts[0])}\";")
@@ -1237,6 +1237,21 @@ def _check_hf_pin(api, pin, token, store, args, sibling_pins=None, resolved=None
                            token, args, sibling_pins, "huggingface")
 
 
+def _member_named(version_row, base_name):
+    """The version's Model file whose basename matches base_name (case-
+    insensitive), else None — our bytes' counterpart in a version."""
+    if not base_name:
+        return None
+    base = os.path.basename(base_name).lower()
+    for f in (version_row.get("files") or []):
+        if f.get("type") != "Model":
+            continue
+        fname = os.path.basename(str(f.get("name") or ""))
+        if fname.lower() == base:
+            return f
+    return None
+
+
 def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
                     source):
     """Family logic shared by civitai pins and hf (by-hash) identities."""
@@ -1326,24 +1341,39 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
         extra = " (+{} more)".format(len(other_base) - 3) if len(other_base) > 3 else ""
         trailing = "newer versions on other base models: {}{}".format(
             ", ".join(shown), extra)
-    hf_note = None
-    if hf_matched_name and hf_matched_name != (pinned_file or {}).get("name"):
-        result["tell"] = "your file is a non-primary member of the civitai " \
-            "version; the candidate replaces the version's primary"
-        hf_note = ("your file is '{}' on this civitai version (primary: "
-                   "'{}')".format(hf_matched_name,
-                                  (pinned_file or {}).get("name")))
-    notes = [n for n in (note_txt, trailing, hf_note) if n]
-    if notes:
-        result["note"] = "; ".join(notes)
-    cand_sha = _file_sha(_primary_file(cand_row))
+    # Our bytes' member on each version: the pin's own provenance file
+    # (civitai), the by-hash matched file (hf), else the primary. Update
+    # candidates target the SAME-NAMED member of the candidate version —
+    # multi-file versions (gguf quant flips, vae/encoder bundles) then
+    # upgrade the right member instead of adopting a different file type.
+    pin_member_name = os.path.basename(str((pin.get("provenance") or {}).get("file") or hf_matched_name or (pinned_file or {}).get("name") or ""))
+    pin_member = _member_named(pinned_row, pin_member_name) or pinned_file
+    cand_sha = _file_sha(pin_member)
     same_verdict = verdict == "up-to-date"
     sha_differs = bool(cand_sha) and bool(pin_sha) and cand_sha != pin_sha
     if same_verdict and source == "civitai" and sha_differs:
         verdict = "drift"
-    cand_file = _primary_file(cand_row)
+    cand_file = _member_named(cand_row, pin_member_name)
+    cand_member = cand_file is not None
+    if not cand_member:
+        cand_file = _primary_file(cand_row)
+    hf_note = None
+    if hf_matched_name and hf_matched_name != (pinned_file or {}).get("name"):
+        if cand_member:
+            hf_note = ("your file is a non-primary member — the update targets "
+                       "the candidate's same-named member")
+        else:
+            result["tell"] = "; ".join(x for x in (
+                result.get("tell"),
+                "your file is a non-primary member of the civitai version — "
+                "the candidate replaces the version's primary") if x)
+            hf_note = ("your file is '{}' on this civitai version (primary: "
+                       "'{}')".format(hf_matched_name,
+                                      (pinned_file or {}).get("name")))
     cand = {
         "versionId": str(cand_row.get("id")),
+        "fileId": _parse_int((cand_file or {}).get("id")),
+        "modelId": mid,
         "baseModel": cand_row.get("baseModel") or None,
         "date": str(cand_row.get("publishedAt") or "")[:10],
         "sha": _file_sha(cand_file),
@@ -1352,6 +1382,18 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
         "downloadUrl": (cand_file or {}).get("downloadUrl"),
         "changelog": str(cand_row.get("changelog") or ""),
     }
+    notes = [n for n in (note_txt, trailing, hf_note) if n]
+    if notes:
+        result["note"] = "; ".join(notes)
+    if cand_member is False and verdict == "update" and (cand.get("fileName") or ""):
+        cand_ext = os.path.splitext(str(cand["fileName"]).lower())[1]
+        dest_ext = os.path.splitext(os.path.basename(str(result["dest"] or "")).lower())[1]
+        if cand_ext and dest_ext and cand_ext != dest_ext:
+            result["tell"] = "; ".join(x for x in (
+                result.get("tell"),
+                "the candidate's primary is a '{}' while your dest is a '{}' "
+                "— resolve the matching member before pasting".format(
+                    cand_ext, dest_ext)) if x)
     result.update(verdict=verdict, source=source, model=model_row,
                   candidate=cand)
     if verdict in ("update", "drift"):
@@ -1372,15 +1414,9 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
                     f"api claims {cand['sha']}"))
             cand["measured"] = measured
             result["candidate"] = cand
-        prov = pin.get("provenance") or {}
-        cand_files = [f for f in (cand_row.get("files") or [])
-                      if f.get("type") == "Model"]
-        file_param = prov.get("file")
-        if verdict != "drift" and (len(cand_files) != 1 or source != "civitai"):
-            file_param = hf_matched_name or cand.get("fileName") or file_param
         result["snippet"] = _snippet(
             pin, cand, verified=bool(cand.get("measured")),
-            keep_name=not args.follow_upstream_names, file=file_param)
+            keep_name=not args.follow_upstream_names)
     return result
 
 

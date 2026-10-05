@@ -44,13 +44,20 @@ in
   # fine without a key, too.
   # file (optional) selects a specific file in a multi-file version; null
   # takes the version's primary file.
+  # fileId (optional) — the member's file id, making the fetch url
+  # ?fileId=<id>: required to actually steer a member download on a
+  # multi-file version (the report tool emits it for member pins).
   # unzipInto (optional) extracts a fetched archive — a workflow bundle
   # zip, say — into a dataDir-relative directory on every service start.
+  # modelId (optional) — the model-page id; lets the update checker skip
+  # its per-pin version-id resolution hop; harmless to omit.
   civitaiFetch = {
     versionId,
     sha256,
     file ? null,
+    fileId ? null,
     unzipInto ? null,
+    modelId ? null,
     # structured destination fields — models/<type>/<arch>/<name>
     type ? null,
     arch ? [ ],
@@ -59,7 +66,7 @@ in
   }: {
     source = "civitai";
     url = "https://civitai.com/api/download/models/${versionId}";
-    inherit versionId sha256 file unzipInto type arch name dest;
+    inherit versionId sha256 file fileId unzipInto type arch name dest modelId;
     tokenFile = cfg.civitaiApiKeyFile;
   };
 }

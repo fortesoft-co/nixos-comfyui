@@ -311,6 +311,26 @@ with lib;
               default = null;
               description = "CivitAI model-version id, used with source = \"civitai\".";
             };
+            modelId = mkOption {
+              type = with types; nullOr (either str int);
+              default = null;
+              description = ''
+                Optional CivitAI model-page id (civitaiFetch only). The update
+                checker skips its version-id resolution hop for entries that
+                carry it; harmless when absent (the tool discovers and caches
+                the mapping itself).
+              '';
+            };
+            fileId = mkOption {
+              type = with types; nullOr int;
+              default = null;
+              description = ''
+                Optional CivitAI file id (civitaiFetch only): targets a
+                specific member of a multi-file version (a gguf quant, a
+                vae/encoder bundle member) via a ?fileId download url.
+                Omitted entries fetch the version's primary file.
+              '';
+            };
             url = mkOption {
               type = with types; nullOr str;
               default = null;

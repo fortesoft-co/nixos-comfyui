@@ -120,7 +120,10 @@ let
     let
       primaryUrls =
         (lib.optional (dl.source == "civitai" && dl.versionId != null)
-          "https://civitai.com/api/download/models/${dl.versionId}")
+          "https://civitai.com/api/download/models/${dl.versionId}${
+            lib.optionalString (dl.fileId != null)
+              "?fileId=${toString dl.fileId}"
+          }")
         ++ (lib.optional
           (dl.source == "huggingface" && dl.repo != null && dl.rev != null)
           "https://huggingface.co/${dl.repo}/resolve/${dl.rev}/${
@@ -147,7 +150,7 @@ let
           || !(lib.hasPrefix "models/" (destOf key dl));
       provenance = lib.filterAttrs (n: v: v != null) {
         source = dl.source;
-        inherit (dl) versionId repo rev file;
+        inherit (dl) versionId repo rev file fileId modelId;
         url = dl.url;
       };
     };

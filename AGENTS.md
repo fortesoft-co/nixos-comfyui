@@ -30,6 +30,8 @@ it, never reference it from tracked files.
 default.nix            entry point; wires cfg.comfyui onto services.comfyui
 modules/options.nix    cfg.comfyui.* interface (shippable defaults)
 modules/sources.nix    hfFetch / civitaiFetch URL+token constructors
+                       (civitaiFetch takes an optional modelId — lets the
+                       update checker skip its version-id resolution hop)
 modules/downloads.nix  pin manifest + pin-plan/pin-seal/pin-audit systemd
                        units around tools/download_runtime.py
                        (content-addressed dataDir/store)
@@ -39,16 +41,18 @@ modules/workflows.nix  declarative workflow installation (read-only mirror:
 modules/mcp.nix        comfy-mcp + comfy-cli for mcpUsers
 modules/reporting.nix  read-only store reporting + civitai update
                        checker (tools/report_runtime.py); drops
-                       <dataDir>/bin/comfyui-report, a tmpfiles symlink
-                       recreated at every rebuild (dataDir-owned tree —
-                       tmpfiles cannot place anything under the
-                       root-owned store/)
+                       <dataDir>/nixos-comfyui-tools/comfyui-report, a
+                       tmpfiles symlink recreated at every rebuild
+                       (dataDir-owned tree — tmpfiles cannot place
+                       anything under the root-owned store/)
 tools/
 download_runtime.py    download runtime (ensure/seal/audit; type="workflows"
                        pins land read-only in the pins/ subtree with
                        per-file checksum state in .pinwork/wf-pin-state)
 report_runtime.py      read-only reporting/update checker (report |
-                       updates subcommands; api GETs only, never writes)
+                       updates subcommands; api GETs only, store bytes
+                       never touched — updates writes report + staging
+                       .nix files into its working directory)
 workflow_runtime.py    workflow mirror pass (repo/ subtree, 0444/0555)
 workflow_api_to_ui.py  API-format -> UI-format workflow converter (authoring-time)
 ```
@@ -198,9 +202,17 @@ pin blocks the boot pass — so verify hashes before pinning and use
 relinked on the next pass, deleted blobs are re-fetched. Seal also
 re-asserts 0444 root:root across the store on every pass.
 
-Store reporting: `<dataDir>/bin/comfyui-report report|updates` —
-read-only, no sudo; `updates` paces civitai API reads, honors 429/Retry-After,
-and can print drop-in `civitaiFetch` entries (`--nix-snippets`).
+Store reporting: `<dataDir>/nixos-comfyui-tools/comfyui-report report|updates` —
+read-only against the store, no sudo; `updates` paces civitai API reads,
+honors 429/Retry-After, sends tokenized requests to civitai.red first,
+resolves hf pins via the by-hash index (`--include-hf`), and writes
+`comfyui-updates.md` plus staging modules into the running directory:
+`comfyui-updates-lm-parity.nix` (the loras/checkpoints/embeddings set,
+matching what Lora Manager's update view shows),
+`comfyui-updates-other.nix` (everything else), and
+`comfyui-updates-verify-first.nix` (entries carrying a shared-candidate
+or non-primary verification tell — inspect, never blind-paste).
+`.lastrun.json` short-circuits same-day reruns; `--fresh` rechecks.
 
 ## Testing loop conventions
 
