@@ -65,8 +65,11 @@ in
     dest ? null,
   }: {
     source = "civitai";
-    url = "https://civitai.com/api/download/models/${versionId}";
-    inherit versionId sha256 file fileId unzipInto type arch name dest modelId;
+    url = "https://civitai.com/api/download/models/${toString versionId}";
+    # the report tool and hand-pasted entries may carry the id as int or
+    # string — normalize once here so urls and the manifest always see str
+    versionId = toString versionId;
+    inherit sha256 file fileId unzipInto type arch name dest modelId;
     tokenFile = cfg.civitaiApiKeyFile;
   };
 }

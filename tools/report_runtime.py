@@ -10,9 +10,8 @@ rebuild), so an operator runs, argument-free:
     <store>/nixos-comfyui-tools/comfyui-report report     local classification
     <store>/nixos-comfyui-tools/comfyui-report updates    live civitai checks;
                                                           writes comfyui-updates.md
-                                                          and one
-                                                          comfyui-updates-<group>.nix
-                                                          (lm-parity vs the rest)
+                                                          + comfyui-updates.nix
+                                                          (all update entries)
                                                           into the current dir
     ...        updates --print-snippets                   + full per-pin listing
 
@@ -62,8 +61,11 @@ API traffic is paced (--delay, default 2.0 s between requests; Retry-After
 honored; 429/5xx backed off exponentially) with one mirror fallback on
 403/404 for entries civitai.com masks; tokenized requests go mirror-first
 (civitai.red serves the identical API), and the mirror's own 404 is
-authoritative — known negatives (hf-only files) cost a single hit. Plus
-an optional json response cache (--cache-ttl, default 24 h). Snippets are
+authoritative — known negatives (hf-only files) cost a single hit. An
+optional json response cache (--cache-ttl hours; OFF by default —
+version lists must refresh daily since civitai can publish same-day
+versions, and .lastrun.json already dedupes same-day reruns; --fresh
+bypasses one too). Snippets are
 printed only from
 API-reported primary-file hashes unless --verify downloads and hashes the
 candidate first; the boot pass sha-gates the real download either way.
@@ -79,20 +81,17 @@ pins whose model page is known — an optional `modelId` in the entry, or
 the .models-map.json sidecar the tool maintains from its own lookups —
 skip the version-id resolution hop entirely. Outputs land as files next
 to where the tool runs: comfyui-updates.md
-plus one paste-ready comfyui-updates-<category>.nix per non-empty
-category — entries grouped exactly like Lora Manager's loras /
-checkpoints / diffusion_models / embeddings buckets, everything else
-under "other". Update entries follow the candidate's upstream filename
-(--no-follow-upstream-names keeps the old dest name); a rename is
-marked as a comment in the module, and the old semantic path becomes
-an update-orphan the audit reports. The default is the SAFE path: only
-clean updates go into the category modules; anything carrying a
-verification tell (a candidate shared by several store pins, or your
-file being a non-primary member of the civitai version) is routed to
-comfyui-updates-verify-first.nix for inspection instead.
-.lastrun.json short-circuits same-day reruns (no rechecking of pins
-already checked today; invalidated by a manifest or tool-version
-change); --fresh forces a full check.
+plus one paste-ready module: comfyui-updates.nix — every update
+entry, category-sectioned, headed with the model name, version name,
+a page link and its tells. Update entries follow the candidate's
+upstream filename (--no-follow-upstream-names keeps the old dest
+name). Civitai authors rename files between versions constantly
+(version stamps, rebrands, quant tags) and multi-artifact pages mix
+unrelated files, so review EVERY entry on its page link and check its
+tells (renames, shared candidates, non-primary members) before
+adopting. .lastrun.json short-circuits same-day reruns (no rechecking
+of pins already checked today; invalidated by a manifest or
+tool-version change); --fresh forces a full check.
 """
 
 import argparse
@@ -109,7 +108,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "report_runtime 1.2"
+VERSION = "report_runtime 1.6"
 
 # Substituted at build time by modules/reporting.nix; both accept
 # explicit --manifest / --dataDir overrides.
@@ -1120,6 +1119,14 @@ def _snippet(pin, cand, verified, keep_name):
     version_part = (f"v{cand['versionId']}"
                     if cand.get("versionId") else "(unknown)")
     verified_part = "  [verified]" if verified else ""
+    lead = []
+    friendly = str(cand.get("modelName") or "").strip().replace("\n", " ")
+    vname = str(cand.get("versionName") or "").strip().replace("\n", " ")
+    if friendly:
+        lead.append("      # {}{}".format(
+            friendly, ' — version "{}"'.format(vname) if vname else ""))
+    if cand.get("pageUrl"):
+        lead.append("      # " + str(cand["pageUrl"]))
     header = (
         f"      # {pin['id']}: {version_part}"
         f" ({cand.get('date') or 'no date'})"
@@ -1127,7 +1134,7 @@ def _snippet(pin, cand, verified, keep_name):
         f"{verified_part}"
         f"  {note_sha}"
     )
-    lines = [header]
+    lines = lead + [header]
     lines.append(f'      "{pin_id}" = civitaiFetch {{')
     if cand.get("versionId"):
         lines.append(f"        versionId = {cand['versionId']};")
@@ -1443,6 +1450,9 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
         "fileName": (cand_file or {}).get("name"),
         "downloadUrl": (cand_file or {}).get("downloadUrl"),
         "changelog": str(cand_row.get("changelog") or ""),
+        "versionName": cand_row.get("name"),
+        "modelName": model_row.get("name") or (mdoc.get("name")),
+        "pageUrl": "https://" + MIRROR_DEFAULT + "/models/" + str(mid) + "?modelVersionId=" + str(cand_row.get("id")),
     }
     notes = [n for n in (skip_note, note_txt, trailing, hf_note) if n]
     dest_base = os.path.basename(str(result["dest"] or ""))
@@ -1457,6 +1467,10 @@ def _assess_version(result, pin, vid, vdoc, mdoc, token, args, sibling_pins,
                             "ext_changed": old_ext != new_ext}
         notes.append("update renames the artifact: {} → {} ({})".format(
             dest_base, cand_base, ext_part))
+        result["tell"] = "; ".join(x for x in (
+            result.get("tell"),
+            "the candidate renames the artifact — verify it is an update of "
+            "the same model, not a sibling upload on the page") if x)
     if notes:
         result["note"] = "; ".join(notes)
     result.update(verdict=verdict, source=source, model=model_row,
@@ -1598,11 +1612,9 @@ def _update_md(path, args, pins, results, targets, tallies, reuse=0, live=0):
             d = cats[cat]
             lines.append("- " + cat + ": " + ", ".join(
                 f"{v} {d[v]}" for v in VERDICTS if d.get(v)))
-    tells_n = sum(1 for r in results if r.get("snippet") and r.get("tell"))
-    if tells_n:
-        lines.append(f"- verify-first: {tells_n} entries carry a verification "
-                     "tell; they went to comfyui-updates-verify-first.nix, "
-                     "not the category modules")
+    upd_n = sum(1 for r in results if r.get("snippet"))
+    lines.append(f"- module: {upd_n} update entries → comfyui-updates.nix "
+                 "— review each on its page link before pasting")
     for v in VERDICTS:
         if counts.get(v):
             lines.append(f"- {v}: {counts[v]}")
@@ -1622,7 +1634,8 @@ def _update_md(path, args, pins, results, targets, tallies, reuse=0, live=0):
         ))
     trows = [r for r in results if r.get("snippet") and r.get("tell")]
     if trows:
-        lines += ["", "## verify-first entries (inspect; never blind-paste)", ""]
+        lines += ["", "## entries with tells (rename / shared-candidate / "
+                  "non-primary — extra caution)", ""]
         for r in trows:
             lines.append(f"- **{r['pin']}** — tell: {r['tell']}")
             if r.get("note"):
@@ -1639,21 +1652,17 @@ def _update_md(path, args, pins, results, targets, tallies, reuse=0, live=0):
     progress(args, "md written: " + path)
 
 
-LM_CLASSES = ("loras", "checkpoints", "diffusion_models", "embeddings")
+CORE_TYPES = ("loras", "checkpoints", "diffusion_models", "embeddings")
 
 
 def _category_of(pin):
-    """LM-style bucket for a pin: loras/checkpoints/diffusion_models/
-    embeddings, else other."""
+    """Core-type bucket for a pin: loras/checkpoints/diffusion_models/
+    embeddings → clean, everything else → other."""
     dest = pin.get("dest") or ""
     parts = dest.split("/")
-    if len(parts) > 2 and parts[0] == "models" and parts[1] in LM_CLASSES:
+    if len(parts) > 2 and parts[0] == "models" and parts[1] in CORE_TYPES:
         return parts[1]
     return "other"
-
-
-def _file_group(category):
-    return "lm-parity" if category in LM_CLASSES else "other"
 
 
 def _lastrun_path(out_dir):
@@ -1728,7 +1737,7 @@ def _save_lastrun(path, pins, results, stored):
     _atomic_write(path, json.dumps(doc, indent=1, sort_keys=True) + "\n")
 
 
-def _write_nix_module(path, header, rows, with_tells=False):
+def _write_nix_module(path, header, rows):
     text = (header + "{ lib, hfFetch, civitaiFetch }:\n\n{\n")
     cur_cat = None
     for r in rows:
@@ -1747,9 +1756,8 @@ def _write_nix_module(path, header, rows, with_tells=False):
             if ren.get("ext_changed"):
                 line = line + " — EXTENSION CHANGES; loaders may need rewiring"
             marks.append(line)
-        if with_tells:
-            marks += ["tell: " + t
-                      for t in str(r.get("tell") or "").split("; ")]
+        marks += ["tell: " + t
+                  for t in str(r.get("tell") or "").split("; ")]
         if marks:
             part = "\n".join("      # " + m for m in marks) + "\n" + part
         text = text + "\n" + part + "\n"
@@ -1780,55 +1788,36 @@ def _save_models_map(path, models_map):
 def _write_updates_files(out_dir, results, args, pins, targets, tallies,
                          reuse_n, live_n):
     os.makedirs(out_dir, exist_ok=True)
-    clean = [r for r in results if r.get("snippet") and not r.get("tell")]
-    tells = [r for r in results if r.get("snippet") and r.get("tell")]
+    for retired in ("comfyui-updates-lm-parity.nix",
+                    "comfyui-updates-verify-first.nix",
+                    "comfyui-updates-clean.nix",
+                    "comfyui-updates-other.nix",
+                    "comfyui-updates-verify.nix"):
+        stale = os.path.join(out_dir, retired)
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    rows = [r for r in results if r.get("snippet")]
     written = []
-    groups = {"lm-parity": [], "other": []}
-    for r in sorted(clean, key=lambda r: (r.get("category") or "other",
-                                          r["pin"])):
-        groups[_file_group(r.get("category") or "other")].append(r)
-    group_headers = {
-        "lm-parity":
-            ("# Lora-Manager-parity updates: the loras / checkpoints /\n"
-             "# diffusion_models / embeddings entries LM's update view\n"
-             "# covers. Clean candidates only (no shared-candidate or\n"
-             "# non-primary tells). Renames are marked as comments — when\n"
-             "# the extension changes too, loaders may need rewiring; the\n"
-             "# old semantic path becomes an update-orphan the audit\n"
-             "# reports. Paste into the matching downloads/<family>.nix\n"
-             "# files.\n"),
-        "other":
-            ("# Updates on pins OUTSIDE Lora Manager's index: text\n"
-             "# encoders, vaes, upscalers, adapters, tooling. Clean\n"
-             "# candidates only; renames marked as in the parity module.\n"
-             "# Safe to paste.\n"),
-    }
-    for gname in ("lm-parity", "other"):
-        rows = groups[gname]
-        if not rows:
-            continue
-        path = os.path.join(out_dir, "comfyui-updates-" + gname + ".nix")
-        _write_nix_module(path, group_headers[gname], rows)
-        written.append((os.path.basename(path), len(rows)))
-    if tells:
-        path = os.path.join(out_dir, "comfyui-updates-verify-first.nix")
-        header = ("# NOT auto-safe — every entry below carries a verification\n"
-                  "# tell: a candidate shared by several store pins (only one\n"
-                  "# can be the real bump) or a non-primary hf file inside a\n"
-                  "# multi-file civitai version. Read the tells + report.\n")
-        _write_nix_module(path, header, sorted(tells, key=lambda r: (
-            r.get("category") or "other", r["pin"])), with_tells=True)
-        written.append((os.path.basename(path), len(tells)))
+    header = ("# CivitAI update candidates — REVIEW BEFORE PASTING.\n"
+              "# Each entry bumps its pin id to the newest version on the\n"
+              "# candidate's model page; entries are category-sectioned and\n"
+              "# headed with the model name, version name, a page link and\n"
+              "# their tells. Renames are the common case on civitai\n"
+              "# (version stamps, rebrands, quant tags) — check each entry\n"
+              "# on its page link (especially renames) and copy only the\n"
+              "# ones you want into downloads/<family>.nix.\n")
+    path = os.path.join(out_dir, "comfyui-updates.nix")
+    _write_nix_module(path, header, sorted(rows, key=lambda r: (
+        r.get("category") or "other", r["pin"])))
+    written.append((os.path.basename(path), len(rows)))
     md_path = args.md or os.path.join(out_dir, "comfyui-updates.md")
     _update_md(md_path, args, pins, results, targets, tallies,
                reuse=reuse_n, live=live_n)
     written.append((os.path.basename(md_path), len(results)))
     return written
-
-
-def _hf_clean_in_group(clean, results, gname):
-    clean_by_id = {r["pin"] for r in clean}
-    return sum(1 for r in results if r["pin"] in clean_by_id and r.get("source") == "huggingface" and _file_group(r.get("category") or "other") == gname)
 
 
 def _console_files_line(written, args):
@@ -1843,40 +1832,20 @@ def _console_summary(args, results, counts, written, reuse_n, live_n):
     print("verdicts: " + ", ".join(
         f"{v} {counts[v]}" for v in VERDICTS if counts.get(v)))
     buckets = {}
-    clean = [r for r in results if r.get("snippet") and not r.get("tell")]
     for r in results:
         if r.get("verdict") not in ("update", "drift"):
             continue
         cat = r.get("category") or "other"
-        b = buckets.setdefault(_file_group(cat), {})
-        b.setdefault(cat, {"clean": 0, "tell": 0})
-        b[cat]["tell" if r.get("tell") else "clean"] += 1
-    for gname in ("lm-parity", "other"):
-        b = buckets.get(gname)
-        if not b:
-            continue
-        label = ("lm-parity (loras/checkpoints/diffusion_models/embeddings)"
-                 if gname == "lm-parity" else "other (outside lm's index)")
-        chunks = []
-        for cat, d in sorted(b.items()):
-            if gname == "other" and cat == "other":
-                chunks.append("{} clean, {} verify-first".format(
-                    d["clean"], d["tell"]))
-            else:
-                chunks.append("{}: {} clean, {} verify-first".format(
-                    cat, d["clean"], d["tell"]))
-        line = f"{label} → {gname}: " + "; ".join(chunks)
-        hf_g = _hf_clean_in_group(clean, results, gname)
-        if hf_g:
-            line = line + " ({} from hf pins)".format(hf_g)
-        print(line)
+        d = buckets.setdefault(cat, {"clean": 0, "tell": 0})
+        d["tell" if r.get("tell") else "clean"] += 1
+    for cat, d in sorted(buckets.items()):
+        print("  {}: {} ok, {} flagged".format(cat, d["clean"], d["tell"]))
     tell_rows = [r for r in results if r.get("snippet") and r.get("tell")]
     if tell_rows:
-        print(f"verify-first: {len(tell_rows)} entries in "
-              "comfyui-updates-verify-first.nix:")
-        for r in tell_rows:
-            first = (r.get("note") or r["tell"])[:100]
-            print(f"  {r['pin']}: {first}")
+        print("all {} update entries → comfyui-updates.nix; {} carry tells —"
+              " review each on its page link before pasting".format(
+                  sum(1 for r in results if r.get("snippet")),
+                  len(tell_rows)))
     if written:
         _console_files_line(written, args)
     errs = counts.get("error", 0)
@@ -1893,7 +1862,7 @@ def cmd_updates(args):
     lastrun_path = _lastrun_path(out_dir)
     stored = _load_lastrun(lastrun_path, pins.manifest_path, args)
     cache_path = None
-    if not args.no_cache:
+    if not args.no_cache and args.cache_ttl and not args.fresh:
         cache_path = args.cache or _default_cache_path()
     if cache_path is None:
         cache_path = ""
@@ -2150,16 +2119,20 @@ newer versions on other base models are notes, not verdict changes.
 
 update entries follow the candidate's upstream filename by default
 (--no-follow-upstream-names restores the dest-name policy); a rename —
-same or changed extension — is marked in the note and as a comment in
-the generated module, and the old semantic path becomes an
-update-orphan the audit reports.
+name-only or extension — carries a `renames the artifact` tell with
+old → new, because civitai authors rename files constantly (version
+stamps, rebrands, quant tags) and multi-artifact pages mix unrelated
+files. Pasting a rename makes the old semantic path an update-orphan
+the audit reports.
 
-files: comfyui-updates.md + comfyui-updates-<category>.nix per category
-(categories: loras, checkpoints, diffusion_models, embeddings, other)
-with CLEAN entries only, plus comfyui-updates-verify-first.nix for
-entries carrying a shared-candidate / non-primary tell — inspect those,
-never blind-paste. .lastrun.json short-circuits same-day reruns
-(invalidated by a manifest or tool-version change); --fresh rechecks all.
+files: comfyui-updates.md + comfyui-updates.nix — every update entry,
+category-sectioned, each headed with the model name, version name, a
+page link, and its tells (rename / shared-candidate / non-primary).
+Review each entry on its page before pasting — never blind-paste.
+.lastrun.json short-circuits same-day reruns (invalidated by a
+manifest or tool-version change); --fresh rechecks all. the api
+response cache is off by default (--cache-ttl N hours to opt in;
+--fresh bypasses it too).
 
 api calls: paced (--delay) against the civitai API only; `report` and the
 local scans never touch the network. exit status: 0, else 1 on any error."""
@@ -2221,10 +2194,14 @@ def build_argparser():
     updates_p.add_argument("--cache", default=None, metavar="PATH",
                            help="cache file location; default "
                            "$XDG_CACHE_HOME/comfyui-report/civitai-cache.json")
-    updates_p.add_argument("--cache-ttl", type=float, default=24.0,
-                           metavar="HOURS", help="cache entry max age")
+    updates_p.add_argument("--cache-ttl", type=float, default=0.0,
+                           metavar="HOURS",
+                           help="OPT-IN response cache age (default: off — "
+                           "version lists must refresh; civitai can publish "
+                           "same-day versions, and .lastrun.json already "
+                           "dedupes same-day reruns; --fresh bypasses it)")
     updates_p.add_argument("--out-dir", default=".", metavar="DIR",
-                           help="where the report + per-category nix modules "
+                           help="where the report and the comfyui-update module "
                            "are written (default: current directory)")
     updates_p.add_argument("--fresh", action="store_true",
                            help="ignore today's .lastrun.json and recheck "

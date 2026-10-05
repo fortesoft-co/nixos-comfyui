@@ -307,9 +307,9 @@ with lib;
               '';
             };
             versionId = mkOption {
-              type = with types; nullOr str;
+              type = with types; nullOr (either str int);
               default = null;
-              description = "CivitAI model-version id, used with source = \"civitai\".";
+              description = "CivitAI model-version id, used with source = \"civitai\"; int or string both accepted (civitaiFetch normalizes to string).";
             };
             modelId = mkOption {
               type = with types; nullOr (either str int);

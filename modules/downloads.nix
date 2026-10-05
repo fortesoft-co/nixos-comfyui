@@ -120,7 +120,7 @@ let
     let
       primaryUrls =
         (lib.optional (dl.source == "civitai" && dl.versionId != null)
-          "https://civitai.com/api/download/models/${dl.versionId}${
+          "https://civitai.com/api/download/models/${toString dl.versionId}${
             lib.optionalString (dl.fileId != null)
               "?fileId=${toString dl.fileId}"
           }")
