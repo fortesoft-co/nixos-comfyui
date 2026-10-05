@@ -207,12 +207,18 @@ read-only against the store, no sudo; `updates` paces civitai API reads,
 honors 429/Retry-After, sends tokenized requests to civitai.red first,
 resolves hf pins via the by-hash index (`--include-hf`), and writes
 `comfyui-updates.md` plus staging modules into the running directory:
-`comfyui-updates-lm-parity.nix` (the loras/checkpoints/embeddings set,
-matching what Lora Manager's update view shows),
+`comfyui-updates-lm-parity.nix` (the loras/checkpoints/diffusion_models/
+embeddings set, mirroring Lora Manager's update view),
 `comfyui-updates-other.nix` (everything else), and
 `comfyui-updates-verify-first.nix` (entries carrying a shared-candidate
 or non-primary verification tell — inspect, never blind-paste).
-`.lastrun.json` short-circuits same-day reruns; `--fresh` rechecks.
+Candidates must carry a loadable weight file — packaging-only versions
+(diffusers/training zips) are skipped and noted. Update entries follow
+the upstream filename; renames (extension changes included) are
+marked as comments, and the old semantic path becomes an
+update-orphan the audit reports. `.lastrun.json` short-circuits
+same-day reruns (invalidated by manifest or tool-version change);
+`--fresh` rechecks.
 
 ## Testing loop conventions
 
