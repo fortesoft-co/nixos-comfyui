@@ -107,7 +107,13 @@ def convert_full(graph):
                     continue  # optional input absent from the graph entirely
                 else:
                     widgets.append(aval)
-                    if meta.get("control_after_generate"):
+                    # control_after_generate is injected by the frontend for
+                    # seed-named INT widgets even when the input config does
+                    # not declare it (impact/ollama packs) — hydration is
+                    # positional, so omitting it shifts every later widget.
+                    if meta.get("control_after_generate") or (
+                            isinstance(typ, str) and typ == "INT"
+                            and "seed" in name):
                         widgets.append("fixed")
 
         outs = []
