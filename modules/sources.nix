@@ -1,8 +1,8 @@
 # Fetch-entry constructors for cfg.comfyui.downloads. Each builds a
 # pinned fetch entry and injects the token appropriate for its source host
 # at eval time — per-source auth is decided here, not guessed at runtime.
-# Transports are resumable curl against the pinned URL (see
-# modules/downloads.nix and tools/download_runtime.py). A plain
+# modules/downloads.nix turns entries into nixos-model-pins entries,
+# which pick the downloader (hf / civitai CLI / curl) automatically. A plain
 # { url, sha256 } attrset stays valid for arbitrary URLs (it simply carries
 # no token).
 {
@@ -13,9 +13,9 @@ let
   cfg = config.cfg.comfyui;
 in
 {
-  # HuggingFace file, pinned to a repo commit SHA. The resolve URL is
-  # fetched with resumable curl; the token (when configured) is a bearer
-  # header that covers gated repos and is harmless on ungated ones.
+  # HuggingFace file, pinned to a repo commit SHA. Downloaded with
+  # `hf download` (curl fallback); the token (when configured) covers
+  # gated repos and is harmless on ungated ones.
   # unzipInto (optional) — same archive-extraction hook as civitaiFetch.
   hfFetch = {
     repo,
@@ -36,17 +36,14 @@ in
     inherit sha256 unzipInto type arch name dest;
   };
 
-  # CivitAI model version, resolved via the download endpoint
-  # (https://civitai.com/api/download/models/<versionId>). Fetched with
-  # resumable curl to a .part file, sha-gated against the entry's pinned
-  # sha256, then placed; the API key rides along as a bearer header on the
-  # initial request (the CDN redirect is signed). Public models download
-  # fine without a key, too.
+  # CivitAI model version, pinned to versionId. With the API key: the
+  # civitai CLI (civitai.red), curl as fallback; without one, curl on the
+  # public download endpoint. Sha-gated against the pinned sha256 either
+  # way; the key only goes to Civitai's own hosts.
   # file (optional) selects a specific file in a multi-file version; null
   # takes the version's primary file.
-  # fileId (optional) — the member's file id, making the fetch url
-  # ?fileId=<id>: required to actually steer a member download on a
-  # multi-file version (the report tool emits it for member pins).
+  # fileId (optional) — the member's file id: steers a member download on
+  # a multi-file version (the report tool emits it for member pins).
   # unzipInto (optional) extracts a fetched archive — a workflow bundle
   # zip, say — into a dataDir-relative directory on every service start.
   # modelId (optional) — the model-page id; lets the update checker skip

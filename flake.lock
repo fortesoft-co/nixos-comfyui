@@ -1,5 +1,24 @@
 {
   "nodes": {
+    "civitai-cli": {
+      "inputs": {
+        "flake-utils": "flake-utils",
+        "nixpkgs": "nixpkgs_2"
+      },
+      "locked": {
+        "lastModified": 1794579267,
+        "narHash": "sha256-pP+mTPUHeRBgPrTWO2DInwkkwb7PDz1gpI2zpTkR/gM=",
+        "owner": "civitai",
+        "repo": "cli",
+        "rev": "50b6355fa092d5b0efb888dbabf8692fcd2004bd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "civitai",
+        "repo": "cli",
+        "type": "github"
+      }
+    },
     "comfyui-nix": {
       "inputs": {
         "flake-parts": "flake-parts",
@@ -37,6 +56,42 @@
         "type": "github"
       }
     },
+    "flake-utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "model-pins": {
+      "inputs": {
+        "civitai-cli": "civitai-cli"
+      },
+      "locked": {
+        "lastModified": 1794717242,
+        "narHash": "sha256-YyVimVpgS2cwRcWvT9kLOUYg8l9Ff/dgS+0VFOa14iE=",
+        "owner": "fortesoft-co",
+        "repo": "nixos-model-pins",
+        "rev": "aca5916e27ae3ec801fe79f110745f3e5ce09c0f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "fortesoft-co",
+        "repo": "nixos-model-pins",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788752844,
@@ -68,9 +123,41 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1784282293,
+        "narHash": "sha256-IpX7tmVJi9seHg5M4Wuexy78bQDlbntVk1HcT9kFts4=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a47c123a609287a012dfc44d281de2dd4ed13394",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "comfyui-nix": "comfyui-nix"
+        "comfyui-nix": "comfyui-nix",
+        "model-pins": "model-pins"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
       }
     }
   },

@@ -221,8 +221,9 @@ with lib;
         as absolute symlinks into the root-owned dataDir/store; dest-style
         entries outside models/ and unzipInto bundles keep real-file
         handling. Existing files are never overwritten; missing content is
-        fetched with resumable curl (tokenFile bearer auth); drift is
-        repaired only after a hash-verified replacement lands.
+        downloaded by nixos-model-pins (hf / civitai CLI / curl, chosen per
+        source); drift is repaired only after a hash-verified replacement
+        lands.
       '';
       type = types.attrsOf (
         types.submodule {
@@ -231,12 +232,12 @@ with lib;
               type = with types; nullOr (enum [ "huggingface" "civitai" ]);
               default = null;
               description = ''
-                Fetch transport. null fetches `url` with resumable curl;
-                "huggingface" resolves
-                https://huggingface.co/<repo>/resolve/<rev>/<file> and
-                "civitai" resolves the model-version download endpoint —
-                both fetched with resumable curl and the entry's tokenFile
-                bearer token (the token covers gated civitai/HF hosts).
+                Download source. null downloads `url` with curl;
+                "huggingface" uses `hf download` (repo/rev/file) and
+                "civitai" the civitai CLI pinned to versionId, both with
+                curl as fallback. The token (entry tokenFile, else
+                huggingfaceTokenFile / civitaiApiKeyFile) only goes to
+                the source's own hosts.
               '';
             };
             repo = mkOption {
@@ -397,8 +398,8 @@ with lib;
       type = with types; nullOr str;
       default = null;
       description = ''
-        systemd OnCalendar schedule for <target>-pin-audit — the boot
-        ensure pass plus a full sweep of the store (every blob re-measured
+        systemd OnCalendar schedule for comfyui-models-verify — the boot
+        fetch pass plus a full sweep of the store (every blob re-measured
         against the digest embedded in its name); orphans and unrecognized
         files are listed, never deleted. null disables the unit and timer.
         Example: "weekly" or "Sun *-01..07 05:00".
@@ -412,7 +413,8 @@ with lib;
       visible = false;
       description = ''
         Internal: the resolved pin manifest (nix store path of
-        <target>-pins.json), set by modules/downloads.nix and consumed by
+        comfyui-pins.json), set by modules/downloads.nix from
+        nixos-model-pins and consumed by
         the read-only reporting module (modules/reporting.nix).
       '';
     };

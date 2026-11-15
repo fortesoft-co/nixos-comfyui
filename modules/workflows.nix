@@ -127,7 +127,7 @@ in
     (lib.mkIf (cfg.workflows != { }) {
       systemd.services.comfyui-workflows-install = {
         description = "Mirror declarative ComfyUI workflows (read-only)";
-        after = [ "comfyui-pin-seal.service" ] ++ cfg.requiresMounts;
+        after = [ "comfyui-models-install.service" ] ++ cfg.requiresMounts;
         before = [ "comfyui.service" ];
         wantedBy = [ "multi-user.target" ];
         serviceConfig = {

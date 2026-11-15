@@ -13,7 +13,7 @@ installs, no host assumptions baked into the module.
 | `default.nix` | Orchestration module: wires the cfg.comfyui interface onto `services.comfyui`, imports everything below. The only entry point. |
 | `modules/options.nix` | `cfg.comfyui.*` options (generic defaults — this folder ships as a module) |
 | `modules/sources.nix` | Fetch-entry constructors: `hfFetch` (HF repo+rev+file) and `civitaiFetch` (civitai versionId), each injecting the right token |
-| `modules/downloads.nix` | Pin-store units (`pin-plan`/`pin-seal`/`pin-audit`) around `tools/download_runtime.py`: content-addressed `dataDir/store`, boot relink/fetch pass, root placement, audit timer |
+| `modules/downloads.nix` | Maps `downloads` onto [nixos-model-pins](https://github.com/fortesoft-co/nixos-model-pins), which provides the content-addressed `dataDir/store`, the boot fetch pass, root placement and the verify timer |
 | `modules/nodes.nix` | Opt-in custom node packs (see below), merged into `services.comfyui.customNodes` |
 | `modules/workflows.nix` | Declarative workflow installation (`workflows` attrset + `workflowDirs` directory mapping) |
 | `modules/mcp.nix` | Comfy Org's MCP server + comfy-cli on `mcpUsers`' PATH |
@@ -115,25 +115,30 @@ Pins live in the consumer's host file. Two destination styles per entry:
   bundles) — fetched straight to the destination, ZIPs extracted into a
   checksummed tree that is re-verified on each pass.
 
-`modules/sources.nix` builds pinned URLs and injects the right token per
-source (fetched with resumable curl):
+`modules/sources.nix` builds pinned entries and injects the right token
+per source; nixos-model-pins picks the downloader:
 
-- `hfFetch { repo, rev, file, sha256 }` — HuggingFace resolve URL pinned to
-  a commit SHA; the HF token covers gated repos and is harmless elsewhere.
-- `civitaiFetch { versionId, sha256 }` — the model-version download
-  endpoint; the key is a bearer token on the initial request only (the CDN
-  redirect is signed).
-- Plain `{ url, sha256 }` attrsets work for arbitrary hosts.
+- `hfFetch { repo, rev, file, sha256 }` — `hf download` pinned to a
+  commit SHA (curl fallback); the HF token covers gated repos and is
+  harmless elsewhere.
+- `civitaiFetch { versionId, sha256 }` — the civitai CLI pinned to the
+  version when an API key is set, otherwise curl on the download
+  endpoint (civitai.red, then civitai.com).
+- Plain `{ url, sha256 }` attrsets work for arbitrary hosts (curl).
+
+Tokens only ever go to their source's own hosts, never to
+`fallbackUrls` mirrors.
 
 Semantics: existing files are **never overwritten** (the seal is the only
 placement, and it parks a drifted file in quarantine instead of destroying
 it), downloads resume, every pin is sha256-gated, `fallbackUrls` keep
 entries alive when upstream disappears, `unzipInto` extracts ZIP packs.
-Three systemd units do the work: `comfyui-pin-plan` (boot pass as the
-service user — relink, fetch, promote), `comfyui-pin-seal` (root oneshot —
-measures, places, owns, links) and `comfyui-pin-audit` (OnCalendar timer,
-via `auditSchedule` — full store sweep + orphan report). Re-run the boot
-pass mid-session with `sudo systemctl start comfyui-pin-plan`.
+Three systemd units do the work: `comfyui-models-fetch` (boot pass as
+the service user — relink, download, stage), `comfyui-models-install`
+(root oneshot — measures, places, owns, links) and
+`comfyui-models-verify` (OnCalendar timer, via `auditSchedule` — full
+store sweep + orphan report). Re-run the boot pass mid-session with
+`sudo systemctl start comfyui-models-fetch comfyui-models-install`.
 
 ## Workflows
 

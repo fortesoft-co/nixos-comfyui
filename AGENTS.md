@@ -3,7 +3,7 @@
 Rules and instructions for agents and humans contributing to this
 repository: a standalone NixOS module for declaratively deploying
 ComfyUI — service wiring, opt-in node packs, a content-addressed model
-store (pin-plan/pin-seal/audit), declarative workflow installation, and
+store (via nixos-model-pins), declarative workflow installation, and
 MCP tooling.
 
 ## Content rules (hard — apply to every commit)
@@ -29,12 +29,13 @@ it, never reference it from tracked files.
 ```
 default.nix            entry point; wires cfg.comfyui onto services.comfyui
 modules/options.nix    cfg.comfyui.* interface (shippable defaults)
-modules/sources.nix    hfFetch / civitaiFetch URL+token constructors
+modules/sources.nix    hfFetch / civitaiFetch entry+token constructors
                        (civitaiFetch takes an optional modelId — lets the
                        update checker skip its version-id resolution hop)
-modules/downloads.nix  pin manifest + pin-plan/pin-seal/pin-audit systemd
-                       units around tools/download_runtime.py
-                       (content-addressed dataDir/store)
+modules/downloads.nix  maps cfg.comfyui.downloads onto the nixos-model-pins
+                       instance "comfyui" (dest composition, tokens,
+                       policy); units, store and runtime are model-pins'
+                       (flake input model-pins)
 modules/nodes.nix      opt-in node packs (enable* flags)
 modules/workflows.nix  declarative workflow installation (read-only mirror:
                        repo/ subtree under <workflowsDir>/nix-managed)
@@ -46,9 +47,6 @@ modules/reporting.nix  read-only store reporting + civitai update
                        (dataDir-owned tree — tmpfiles cannot place
                        anything under the root-owned store/)
 tools/
-download_runtime.py    download runtime (ensure/seal/audit; type="workflows"
-                       pins land read-only in the pins/ subtree with
-                       per-file checksum state in .pinwork/wf-pin-state)
 report_runtime.py      read-only reporting/update checker (report |
                        updates subcommands; api GETs only, store bytes
                        never touched — updates writes report + staging
@@ -189,13 +187,12 @@ node output type — genuine STRING sockets always declare `forceInput`.
 
 ## Pin store ops
 
-`comfyui-pin-plan` (boot, service user) relinks and fetches;
-`comfyui-pin-seal` (root, placement + ownership only) lands blobs and
-links; `comfyui-pin-audit` (OnCalendar timer via `auditSchedule`) sweeps
-the whole store and reports orphans. If entries were added since the last
-boot: `sudo systemctl start comfyui-pin-plan` (the seal follows via the
-unit graph; run `sudo systemctl start comfyui-pin-seal` by hand when
-needed). Ensure **fails as a unit** if any pin cannot be satisfied — a bad
+`comfyui-models-fetch` (boot, service user) relinks and downloads;
+`comfyui-models-install` (root, placement + ownership only) lands blobs
+and links; `comfyui-models-verify` (OnCalendar timer via `auditSchedule`)
+sweeps the whole store and reports orphans. If entries were added since
+the last boot: `sudo systemctl start comfyui-models-fetch
+comfyui-models-install`. Fetch **fails as a unit** if any pin cannot be satisfied — a bad
 pin blocks the boot pass — so verify hashes before pinning and use
 `fallbackUrls` for fragile sources. Store blobs are root:root 0444 under
 `dataDir/store`; `models/**` entries are absolute symlinks: moved links are

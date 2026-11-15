@@ -1,6 +1,6 @@
 """report_runtime — read-only reporting + update checks for the pin store.
 
-Companion to tools/download_runtime.py: never writes store bytes, never
+Companion to the nixos-model-pins runtime: never writes store bytes, never
 needs elevated permissions. Reads the pin manifest, the store and the
 models tree; the `updates` subcommand additionally queries the civitai
 API. The reporting module drops the binary into <store>/bin as a
