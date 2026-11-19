@@ -5,6 +5,11 @@
 # service — over HTTP on 127.0.0.1 (the configured port). The server is a thin wrapper that
 # shells out to comfy-cli, so both are packaged here into one interpreter env.
 #
+# Optionally (enableMcpServer) the same server also runs as one shared
+# systemd service over streamable HTTP on loopback, via
+# tools/comfy_mcp_http.py, for clients that should connect by URL instead of
+# spawning the binary.
+#
 # Every version below is pinned by hash and locked by the flake: no runtime
 # pip installs anywhere in this chain. The mcp SDK 2.x and mcp-types are
 # pinned here (not from nixpkgs) because the locked nixpkgs still ships the
@@ -184,16 +189,85 @@ let
     ln -s ${comfyMcpEnv}/bin/comfy $out/bin/comfy
     ln -s ${comfyMcpEnv}/bin/comfy-mcp $out/bin/comfy-mcp
   '';
+  cfg = config.cfg.comfyui;
+  stateDir = "/var/lib/comfy-mcp";
 in
 {
-  # comfy-mcp + comfy-cli on the configured users' PATH (cfg.comfyui.mcpUsers).
-  # The per-user profile path is stable across rebuilds, so MCP clients can
-  # reference it by absolute path:
-  #   /etc/profiles/per-user/<user>/bin/comfy-mcp
-  #   /etc/profiles/per-user/<user>/bin/comfy
-  config = lib.mkIf (config.cfg.comfyui.mcpUsers != [ ]) {
-    users.users = lib.genAttrs config.cfg.comfyui.mcpUsers (_: {
-      packages = [ comfyMcpTools ];
-    });
-  };
+  config = lib.mkMerge [
+    # comfy-mcp + comfy-cli on the configured users' PATH (cfg.comfyui.mcpUsers).
+    # The per-user profile path is stable across rebuilds, so MCP clients can
+    # reference it by absolute path:
+    #   /etc/profiles/per-user/<user>/bin/comfy-mcp
+    #   /etc/profiles/per-user/<user>/bin/comfy
+    (lib.mkIf (cfg.mcpUsers != [ ]) {
+      users.users = lib.genAttrs cfg.mcpUsers (_: {
+        packages = [ comfyMcpTools ];
+      });
+    })
+
+    # Shared comfy-mcp over streamable HTTP on loopback
+    # (cfg.comfyui.enableMcpServer). tools/comfy_mcp_http.py serves the same
+    # server object with the lifecycle/install/login tools removed and a
+    # stage_workflow tool added. Its workspace (comfy-cli config and job state,
+    # staged workflows, fetched outputs) is the unit's StateDirectory; the
+    # comfyui group gives read access to the installed workflows.
+    (lib.mkIf cfg.enableMcpServer {
+      systemd.services.comfy-mcp = {
+        description = "Comfy MCP server (streamable HTTP, loopback)";
+        after = [
+          "network.target"
+          "comfyui.service"
+        ];
+        wantedBy = [ "multi-user.target" ];
+        environment = {
+          HOME = stateDir;
+          COMFY_PROJECT = stateDir;
+          COMFY_BIN = "${comfyMcpEnv}/bin/comfy";
+          COMFY_LOCAL_URL = "http://127.0.0.1:${toString cfg.port}";
+          DO_NOT_TRACK = "1";
+          COMFY_NO_TELEMETRY = "1";
+        };
+        serviceConfig = {
+          ExecStart = lib.escapeShellArgs [
+            "${comfyMcpEnv}/bin/python3"
+            "${../tools/comfy_mcp_http.py}"
+            "--host"
+            "127.0.0.1"
+            "--port"
+            (toString cfg.mcpServerPort)
+            "--stage-dir"
+            "${stateDir}/staged"
+          ];
+          DynamicUser = true;
+          SupplementaryGroups = [ cfg.group ];
+          StateDirectory = "comfy-mcp";
+          WorkingDirectory = stateDir;
+          Restart = "on-failure";
+          RestartSec = 5;
+
+          CapabilityBoundingSet = "";
+          LockPersonality = true;
+          PrivateDevices = true;
+          PrivateTmp = true;
+          ProtectClock = true;
+          ProtectControlGroups = true;
+          ProtectHome = true;
+          ProtectHostname = true;
+          ProtectKernelLogs = true;
+          ProtectKernelModules = true;
+          ProtectKernelTunables = true;
+          ProtectProc = "invisible";
+          ProtectSystem = "strict";
+          RestrictAddressFamilies = [
+            "AF_INET"
+            "AF_INET6"
+            "AF_UNIX"
+          ];
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          SystemCallArchitectures = "native";
+        };
+      };
+    })
+  ];
 }

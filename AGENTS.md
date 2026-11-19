@@ -39,7 +39,8 @@ modules/downloads.nix  maps cfg.comfyui.downloads onto the nixos-model-pins
 modules/nodes.nix      opt-in node packs (enable* flags)
 modules/workflows.nix  declarative workflow installation (read-only mirror:
                        repo/ subtree under <workflowsDir>/nix-managed)
-modules/mcp.nix        comfy-mcp + comfy-cli for mcpUsers
+modules/mcp.nix        comfy-mcp + comfy-cli for mcpUsers; optional shared
+                       HTTP service on loopback (enableMcpServer)
 modules/reporting.nix  read-only store reporting + civitai update
                        checker (tools/report_runtime.py); drops
                        <dataDir>/nixos-comfyui-tools/comfyui-report, a
@@ -53,6 +54,9 @@ report_runtime.py      read-only reporting/update checker (report |
                        .nix files into its working directory)
 workflow_runtime.py    workflow mirror pass (repo/ subtree, 0444/0555)
 workflow_api_to_ui.py  API-format -> UI-format workflow converter (authoring-time)
+comfy_mcp_http.py      comfy-mcp over streamable HTTP for the shared service
+                       (lifecycle/install/login tools removed, stage_workflow
+                       added)
 ```
 
 An inverse converter (UI-format -> API-format, schema-driven from the live

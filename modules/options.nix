@@ -72,6 +72,24 @@ with lib;
       '';
     };
 
+    enableMcpServer = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Run comfy-mcp as a shared systemd service over streamable HTTP at
+        http://127.0.0.1:<mcpServerPort>/mcp, so local clients connect by
+        URL instead of spawning the binary. Binds loopback only and has no
+        authentication of its own: put a reverse proxy with auth in front
+        for remote access. Independent of mcpUsers.
+      '';
+    };
+
+    mcpServerPort = mkOption {
+      type = types.port;
+      default = 8190;
+      description = "Loopback port of the shared comfy-mcp HTTP server.";
+    };
+
     enableCivitaiNodes = mkOption {
       type = types.bool;
       default = false;
