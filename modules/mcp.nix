@@ -231,6 +231,18 @@ in
           COMFY_NO_TELEMETRY = "1";
         };
         serviceConfig = {
+          # comfy-cli's `comfy logs` (comfy-mcp's get_logs tool) resolves the
+          # captured log under <workspace>/user/ and falls back to
+          # %h/comfy/ComfyUI when no workspace is configured — its config
+          # keys (default/recent workspace) are validated as real ComfyUI
+          # checkouts, so the service dataDir cannot be named there. Redirect
+          # the fallback workspace's user dir at the real one instead: every
+          # candidate (comfyui_<port>.log, comfyui.log, comfyui_*.log) then
+          # lands on <dataDir>/user/, where the comfyui unit writes its log.
+          ExecStartPre = [
+            "${pkgs.coreutils}/bin/mkdir -p %h/comfy/ComfyUI"
+            "${pkgs.coreutils}/bin/ln -sfn ${cfg.dataDir}/user %h/comfy/ComfyUI/user"
+          ];
           ExecStart = lib.escapeShellArgs (
             [
               "${comfyMcpEnv}/bin/python3"
