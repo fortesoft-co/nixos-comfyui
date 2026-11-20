@@ -25,6 +25,16 @@
 # inside ComfyUI's env, which this one is not) and blake3 1.0.8 (wants
 # >=1.0.9).
 #
+# Template gallery: comfy-cli's template tools resolve their catalog (and
+# each template's workflow file) from GitHub raw at run time. The MCP service
+# instead reads the same content from comfyui-nix's pinned workflow-templates
+# wheel — the identical fixed-output derivation the ComfyUI service installs —
+# so template fetches never need the network and always match the locked
+# snapshot. The catalog search stays live when online (the gallery index is
+# fetched with a stale-while-revalidate cache, seeded at start from the same
+# wheel); offline, every consumer falls back to the seeded/stale cache by
+# comfy-cli's own design.
+#
 # Lifecycle note: comfy-cli's install/update/stop verbs assume it owns a
 # ComfyUI checkout, so with the Nix-managed service stick to the HTTP tools
 # (run_workflow, generate_image, run_template, job, fetch_outputs, ...) and
@@ -34,6 +44,7 @@
   config,
   pkgs,
   lib,
+  comfyui-nix,
   ...
 }:
 let
@@ -104,14 +115,37 @@ let
     };
   };
 
+  # The pinned workflow-templates wheel (comfyui-nix's own pin — the same
+  # fixed-output derivation the ComfyUI service installs, so this build reads
+  # it from the store without touching the network). Carries the gallery
+  # index and every template JSON.
+  versions = import "${comfyui-nix}/nix/versions.nix";
+  templatesWheel = pkgs.fetchurl {
+    inherit (versions.vendored.workflowTemplates) url hash;
+  };
+  galleryDir = pkgs.runCommand "comfy-mcp-template-gallery" {
+    nativeBuildInputs = [ pkgs.unzip ];
+  } ''
+    mkdir -p $out
+    unzip -q ${templatesWheel} 'comfyui_workflow_templates_json/templates/*' -d $out
+  '';
+
   comfyCli = py.buildPythonPackage rec {
     pname = "comfy-cli";
     version = "1.20.0";
     format = "wheel";
     src = pkgs.fetchurl {
       url = "https://files.pythonhosted.org/packages/21/5c/38ce566cfec9fa596da3035cd7a472cdf0b35aecc84bfa6592786c86e8da/comfy_cli-1.20.0-py3-none-any.whl";
-      hash = "sha256-xGkB/md++SR4tRGnU8oK5gO7aVnUpL5qI4O47JvfD/g=";
+      hash = "sha256-xgkB/md++SR4tRGnU8oK5gO7aVnUpL5qI4O47JvfD/g=";
     };
+    # Template workflow files resolve from the pinned wheel instead of
+    # GitHub raw (see the header note) — same names, same content, no
+    # network, always matching the locked snapshot.
+    postPatch = ''
+      substituteInPlace comfy_cli/command/templates.py \
+        --replace-fail 'https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}.json' \
+                       'file://${galleryDir}/comfyui_workflow_templates_json/templates/{name}.json'
+    '';
     dependencies = with py; [
       certifi
       charset-normalizer
@@ -231,6 +265,11 @@ in
           COMFY_NO_TELEMETRY = "1";
         };
         serviceConfig = {
+          # Seed the gallery-index cache from the pinned wheel so template
+          # search works offline from the first start; --no-clobber keeps
+          # any fresher online-fetched cache (stale-while-revalidate replaces
+          # the seed with the live catalog once the network is back).
+          #
           # comfy-cli's `comfy logs` (comfy-mcp's get_logs tool) resolves the
           # captured log under <workspace>/user/ and falls back to
           # $HOME/comfy/ComfyUI when no workspace is configured — its config
@@ -242,9 +281,15 @@ in
           # stateDir is spelled out (not a %h specifier — with DynamicUser
           # it resolves against root's home, not the service's).
           ExecStartPre = [
+            "${pkgs.coreutils}/bin/mkdir -p ${stateDir}/.cache/comfy-cli/gallery"
+            "${pkgs.coreutils}/bin/cp --no-clobber ${galleryDir}/comfyui_workflow_templates_json/templates/index.json ${stateDir}/.cache/comfy-cli/gallery/index.json"
             "${pkgs.coreutils}/bin/mkdir -p ${stateDir}/comfy/ComfyUI"
             "${pkgs.coreutils}/bin/ln -sfn ${cfg.dataDir}/user ${stateDir}/comfy/ComfyUI/user"
           ];
+          # An open SSE stream (a connected browser client) keeps uvicorn
+          # from exiting; cut restarts short instead of hanging the full
+          # default stop timeout.
+          TimeoutStopSec = 15;
           ExecStart = lib.escapeShellArgs (
             [
               "${comfyMcpEnv}/bin/python3"
