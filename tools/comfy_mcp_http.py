@@ -92,7 +92,29 @@ def _register_stage_workflow(stage_dir: Path) -> None:
         tools (``run_workflow``, ``validate_workflow``, ``set_workflow_slot``,
         ``vary_workflow``). Files are named by content hash, so staging the
         same workflow twice returns the same path.
+
+        Structurally checked at stage time: in API format, a node that
+        declares a class_type but carries no ``inputs`` object — or a
+        top-level entry that is not an object — is rejected here by node
+        id. That shape sails through validation (only a reachability
+        warning) and explodes server-side instead: a KeyError in every
+        on-prompt hook and an HTTP 500 from the prompt handler, measured
+        live. It must never receive a path.
         """
+        problems: list[str] = []
+        if isinstance(workflow, dict) and not isinstance(workflow.get("nodes"), list):
+            for nid, node in workflow.items():
+                if isinstance(node, dict):
+                    if "class_type" in node and not isinstance(node.get("inputs"), dict):
+                        problems.append(
+                            f'node {nid!r} ({node["class_type"]}) has no "inputs" '
+                            'object — every node is {"class_type": ..., '
+                            '"inputs": {...}}'
+                        )
+                else:
+                    problems.append(f"node {nid!r} is not an object")
+        if problems:
+            raise ToolError("; ".join(problems))
         data = json.dumps(workflow, sort_keys=True, separators=(",", ":")).encode()
         path = stage_dir / f"{hashlib.sha256(data).hexdigest()}.json"
         if not path.exists():
