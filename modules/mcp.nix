@@ -152,6 +152,18 @@ let
       substituteInPlace comfy_cli/command/templates.py \
         --replace-fail 'https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}.json' \
                        'file://${galleryDir}/comfyui_workflow_templates_json/templates/{name}.json'
+      # The file:// gallery URL cannot pass through plain_urlopen (its
+      # opener is http(s)-only — "unknown url type: file"), and the
+      # response status check would reject a plain file handle: read
+      # pinned files straight from disk; http(s) keeps the original path.
+      substituteInPlace comfy_cli/command/templates.py \
+        --replace-fail 'url = _TEMPLATE_WORKFLOW_URL.format(name=urllib.parse.quote(name, safe=""))
+          req = urllib.request.Request(url, headers={"User-Agent": "comfy-cli"})' \
+                       'url = _TEMPLATE_WORKFLOW_URL.format(name=urllib.parse.quote(name, safe=""))
+          if url.startswith("file://"):
+              with open(urllib.request.url2pathname(urllib.parse.urlparse(url).path), "rb") as fh:
+                  return fh.read()
+          req = urllib.request.Request(url, headers={"User-Agent": "comfy-cli"})'
     '';
     dependencies = with py; [
       certifi
