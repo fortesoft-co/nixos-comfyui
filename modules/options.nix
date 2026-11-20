@@ -77,17 +77,45 @@ with lib;
       default = false;
       description = ''
         Run comfy-mcp as a shared systemd service over streamable HTTP at
-        http://127.0.0.1:<mcpServerPort>/mcp, so local clients connect by
-        URL instead of spawning the binary. Binds loopback only and has no
-        authentication of its own: put a reverse proxy with auth in front
-        for remote access. Independent of mcpUsers.
+        http://<mcpServerListenAddress>:<mcpServerPort>/mcp, so clients
+        connect by URL instead of spawning the binary. Binds loopback only
+        by default and has no authentication of its own: put a reverse
+        proxy with auth in front for remote access, or bind a trusted LAN
+        and allow exactly the browser origins that need it (see
+        mcpAllowedOrigins). Independent of mcpUsers.
       '';
     };
 
     mcpServerPort = mkOption {
       type = types.port;
       default = 8190;
-      description = "Loopback port of the shared comfy-mcp HTTP server.";
+      description = "Port of the shared comfy-mcp HTTP server.";
+    };
+
+    mcpServerListenAddress = mkOption {
+      type = types.str;
+      default = "127.0.0.1";
+      description = ''
+        Bind address of the shared comfy-mcp HTTP server. The default
+        keeps it loopback-only; set a LAN address (or "0.0.0.0") to serve
+        browsers on other machines. The service has no authentication of
+        its own — expose it only on networks you trust.
+      '';
+    };
+
+    mcpAllowedOrigins = mkOption {
+      type = with types; listOf str;
+      default = [ ];
+      description = ''
+        Browser-client origins (exact scheme://host:port match) the shared
+        HTTP service answers CORS preflights for. Required by browser-side
+        MCP clients such as llama-server's web UI: their page origin differs
+        from the service's, so the browser blocks direct fetches without
+        CORS answers — including the Private-Network-Access preflight a
+        LAN page needs to call a local address. Empty (the default) serves
+        no CORS headers, so only same-origin clients connect. Non-browser
+        clients are unaffected either way.
+      '';
     };
 
     enableCivitaiNodes = mkOption {

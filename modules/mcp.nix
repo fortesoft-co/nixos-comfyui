@@ -6,9 +6,12 @@
 # shells out to comfy-cli, so both are packaged here into one interpreter env.
 #
 # Optionally (enableMcpServer) the same server also runs as one shared
-# systemd service over streamable HTTP on loopback, via
-# tools/comfy_mcp_http.py, for clients that should connect by URL instead of
-# spawning the binary.
+# systemd service over streamable HTTP (mcpServerListenAddress, default
+# loopback), via tools/comfy_mcp_http.py, for clients that should connect by
+# URL instead of spawning the binary. Browser-side MCP clients (e.g.
+# llama-server's web UI) additionally need mcpAllowedOrigins: the page's
+# origin differs from the service's, so the browser requires CORS
+# preflight answers the tool only emits when origins are configured.
 #
 # Every version below is pinned by hash and locked by the flake: no runtime
 # pip installs anywhere in this chain. The mcp SDK 2.x and mcp-types are
@@ -205,7 +208,7 @@ in
       });
     })
 
-    # Shared comfy-mcp over streamable HTTP on loopback
+    # Shared comfy-mcp over streamable HTTP
     # (cfg.comfyui.enableMcpServer). tools/comfy_mcp_http.py serves the same
     # server object with the lifecycle/install/login tools removed and a
     # stage_workflow tool added. Its workspace (comfy-cli config and job state,
@@ -213,7 +216,7 @@ in
     # comfyui group gives read access to the installed workflows.
     (lib.mkIf cfg.enableMcpServer {
       systemd.services.comfy-mcp = {
-        description = "Comfy MCP server (streamable HTTP, loopback)";
+        description = "Comfy MCP server (streamable HTTP)";
         after = [
           "network.target"
           "comfyui.service"
@@ -228,16 +231,19 @@ in
           COMFY_NO_TELEMETRY = "1";
         };
         serviceConfig = {
-          ExecStart = lib.escapeShellArgs [
-            "${comfyMcpEnv}/bin/python3"
-            "${../tools/comfy_mcp_http.py}"
-            "--host"
-            "127.0.0.1"
-            "--port"
-            (toString cfg.mcpServerPort)
-            "--stage-dir"
-            "${stateDir}/staged"
-          ];
+          ExecStart = lib.escapeShellArgs (
+            [
+              "${comfyMcpEnv}/bin/python3"
+              "${../tools/comfy_mcp_http.py}"
+              "--host"
+              cfg.mcpServerListenAddress
+              "--port"
+              (toString cfg.mcpServerPort)
+              "--stage-dir"
+              "${stateDir}/staged"
+            ]
+            ++ lib.concatMap (o: [ "--allow-origin" o ]) cfg.mcpAllowedOrigins
+          );
           DynamicUser = true;
           SupplementaryGroups = [ cfg.group ];
           StateDirectory = "comfy-mcp";

@@ -3,7 +3,7 @@
 comfy-mcp's own entry point only speaks stdio, so every client spawns a
 private copy. This launcher imports the same server object and runs it with
 the MCP SDK's streamable-http transport instead, so one systemd unit
-(modules/mcp.nix) can serve every local client on 127.0.0.1.
+(modules/mcp.nix) can serve every local client on the configured address.
 
 Changes against the stdio server:
 
@@ -16,6 +16,11 @@ Changes against the stdio server:
   this machine, so a client without access to this filesystem stages the
   workflow first and passes the returned path on.
 - The handshake instructions gain a short note on both.
+
+Pass --allow-origin (repeatable) to serve cross-origin browser clients
+(e.g. llama-server's web UI, whose MCP support runs in the page and
+therefore needs CORS preflight answers). Without any origin the service
+behaves exactly as before and never emits CORS headers.
 """
 
 from __future__ import annotations
@@ -27,6 +32,9 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import uvicorn
+from starlette.middleware.cors import CORSMiddleware
 
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -107,13 +115,42 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--stage-dir", type=Path, required=True)
+    parser.add_argument(
+        "--allow-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="cross-origin browser clients to serve (exact scheme://host:port); "
+        "repeatable. Without any, no CORS headers are emitted and only "
+        "same-origin clients can connect",
+    )
     args = parser.parse_args()
 
     args.stage_dir.mkdir(parents=True, exist_ok=True)
     _remove_tools()
     _register_stage_workflow(args.stage_dir)
     _apply_instructions()
-    server.mcp.run(transport="streamable-http", host=args.host, port=args.port)
+
+    if not args.allow_origin:
+        server.mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        return
+
+    # Same app FastMCP.run() would build, wrapped for cross-origin browser
+    # clients: CORS with the Private-Network-Access answer a LAN page needs
+    # to call this local service from Chrome, and the session headers a
+    # browser client must read off the initialize response. The service
+    # stays unauthenticated — allow only origins you trust.
+    app = server.mcp.streamable_http_app()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=args.allow_origin,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id", "mcp-protocol-version"],
+        allow_private_network=True,
+        allow_credentials=False,
+    )
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
