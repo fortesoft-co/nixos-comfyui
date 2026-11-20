@@ -238,8 +238,8 @@ same-day reruns (invalidated by manifest or tool-version change);
 - `sudo systemctl restart comfyui` — the only lifecycle.
 - Logs: `comfyui_8188.log` under `dataDir/user/` (the service writes it
   there). `comfy logs` reads `<workspace>/user/`: the shared comfy-mcp
-  service redirects its fallback workspace (`%h/comfy/ComfyUI/user`) at
-  the real user dir (modules/mcp.nix), so get_logs works through it; a
+  service redirects its fallback workspace (`<StateDirectory>/comfy/ComfyUI/user`)
+  at the real user dir (modules/mcp.nix), so get_logs works through it; a
   human CLI user needs the same redirect in their own home
   (`~/comfy/ComfyUI/user -> <dataDir>/user`) — comfy-cli's config keys
   are validated as real ComfyUI checkouts, so naming the dataDir there
