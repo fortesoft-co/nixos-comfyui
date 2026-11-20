@@ -120,8 +120,11 @@ let
   # it from the store without touching the network). Carries the gallery
   # index and every template JSON.
   versions = import "${comfyui-nix}/nix/versions.nix";
+  # NOTE: workflowTemplatesJson (0.1.x), not workflowTemplates (0.11.x) —
+  # the JSON wheel carries comfyui_workflow_templates_json/templates/ (index +
+  # every template); the category package has a different layout.
   templatesWheel = pkgs.fetchurl {
-    inherit (versions.vendored.workflowTemplates) url hash;
+    inherit (versions.vendored.workflowTemplatesJson) url hash;
   };
   galleryDir = pkgs.runCommand "comfy-mcp-template-gallery" {
     nativeBuildInputs = [ pkgs.unzip ];
@@ -133,11 +136,15 @@ let
   comfyCli = py.buildPythonPackage rec {
     pname = "comfy-cli";
     version = "1.20.0";
-    format = "wheel";
+    # Built from the sdist, not the wheel: wheels are only staged into
+    # dist/ (never unpacked), so postPatch would have no source tree to
+    # patch — the sdist ships one (setuptools.build_meta, PEP 517-clean).
+    format = "pyproject";
     src = pkgs.fetchurl {
-      url = "https://files.pythonhosted.org/packages/21/5c/38ce566cfec9fa596da3035cd7a472cdf0b35aecc84bfa6592786c86e8da/comfy_cli-1.20.0-py3-none-any.whl";
-      hash = "sha256-xgkB/md++SR4tRGnU8oK5gO7aVnUpL5qI4O47JvfD/g=";
+      url = "https://files.pythonhosted.org/packages/3a/32/5388a43a6239f4e859b2c852804f11d1e67a0dc7a02c37580563fe5a2d3b/comfy_cli-1.20.0.tar.gz";
+      hash = "sha256-GtX9s/q2LxF552V1W760XtpylorC5KcoEERdOQPUiZA=";
     };
+    nativeBuildInputs = [ py.setuptools ];
     # Template workflow files resolve from the pinned wheel instead of
     # GitHub raw (see the header note) — same names, same content, no
     # network, always matching the locked snapshot.
@@ -183,7 +190,6 @@ let
       description = "ComfyUI CLI (engine behind comfy-mcp's tools)";
       homepage = "https://github.com/Comfy-Org/comfy-cli";
       license = lib.licenses.gpl3Only;
-      sourceProvenance = with lib.sourceTypes; [ binaryWheel ];
     };
   };
 
