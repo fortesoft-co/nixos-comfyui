@@ -16,6 +16,11 @@ Changes against the stdio server:
   this machine, so a client without access to this filesystem stages the
   workflow first and passes the returned path on.
 - The handshake instructions gain a short note on both.
+- Argument-key hygiene: small local models sometimes emit object keys with
+  stray double-quote characters ({"\"57.text\"": ...} for {"57.text": ...})
+  — a JSON encoding-depth slip, not a semantic choice. Before dispatch,
+  quotes are stripped from argument keys at every nesting depth (values
+  are never modified); every tool here has unquoted keys.
 
 Pass --allow-origin (repeatable) to serve cross-origin browser clients
 (e.g. llama-server's web UI, whose MCP support runs in the page and
@@ -110,6 +115,60 @@ def _apply_instructions() -> None:
     server.mcp._lowlevel_server.instructions = f"{current}\n{SHARED_NOTE}"
 
 
+def _strip_key_quotes(obj: Any) -> Any:
+    """Strip stray double-quote characters from argument keys, at any depth."""
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            nk = k.replace('"', "") if isinstance(k, str) else k
+            if nk != k:
+                print(f"key hygiene: stripped quotes from argument key {k!r}", flush=True)
+            out[nk] = _strip_key_quotes(v)
+        return out
+    if isinstance(obj, list):
+        return [_strip_key_quotes(x) for x in obj]
+    return obj
+
+
+def _install_key_hygiene() -> None:
+    """Normalize the small-model argument-key artifact before dispatch.
+
+    Measured on this box: small tool-calling models can emit object keys
+    with embedded quote characters — {"\"57.text\"": ...} instead of
+    {"57.text": ...} — which silently corrupts slot addresses and
+    workflow node ids. No tool on this surface has a quoted key, so the
+    quotes are dropped from keys (values untouched) before the tool
+    runs. Well-formed clients are unaffected: a no-op walk.
+    """
+    low = server.mcp._lowlevel_server
+    handlers = getattr(low, "request_handlers", None) or getattr(low, "_request_handlers", None)
+    if handlers is None:
+        return
+    key = next((k for k in handlers if "tools/call" in str(k)), None)
+    if key is None:
+        return
+    entry = handlers[key]
+    inner = entry.handler
+
+    async def wrapped(context: Any, params: Any) -> Any:
+        args = getattr(params, "arguments", None)
+        if isinstance(args, dict):
+            cleaned = _strip_key_quotes(args)
+            if cleaned != args:
+                try:
+                    params.arguments = cleaned
+                except Exception:
+                    params = params.model_copy(update={"arguments": cleaned})
+        return await inner(context, params)
+
+    # The dispatcher validates params through the entry's params_type
+    # before invoking entry.handler — swap only the callable.
+    try:
+        entry.handler = wrapped
+    except AttributeError:
+        handlers[key] = type(entry)(params_type=entry.params_type, handler=wrapped)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
@@ -130,6 +189,7 @@ def main() -> None:
     _remove_tools()
     _register_stage_workflow(args.stage_dir)
     _apply_instructions()
+    _install_key_hygiene()
 
     if not args.allow_origin:
         server.mcp.run(transport="streamable-http", host=args.host, port=args.port)
